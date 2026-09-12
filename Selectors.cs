@@ -48,6 +48,10 @@ namespace BlackJacket.OptimalPlay
             {
                 return false;
             }
+            if (!Progression.HasPlayedTutorial)
+            {
+                return false;
+            }
 
             _nodeBudget = Math.Max(2000, cfg.SearchNodeBudget.Value / 10);
             _timeMs = Math.Max(5, cfg.SearchTimeMs.Value / 10);
