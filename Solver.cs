@@ -217,6 +217,19 @@ namespace BlackJacket.OptimalPlay
             return best;
         }
 
+        /// <summary>
+        /// Value of a position, running the same game loop the draw phase would, without
+        /// choosing a move at the root. Used to score candidate deck orders and card picks.
+        /// </summary>
+        public float Evaluate(SolverState root)
+        {
+            _memo = new Dictionary<string, float>();
+            _nodes = 0;
+            _aborted = false;
+            _startMs = Environment.TickCount;
+            return AfterPlayerAction(root);
+        }
+
         // ---------------------------------------------------------------- search
 
         /// <summary>Best value for the player when it is the player's turn to choose.</summary>

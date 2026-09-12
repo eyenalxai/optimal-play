@@ -12,7 +12,7 @@ namespace BlackJacket.OptimalPlay
     {
         public const string PluginGuid = "com.blackjacket.mods.optimalplay";
         public const string PluginName = "Black Jacket - Optimal Play";
-        public const string PluginVersion = "1.0.0";
+        public const string PluginVersion = "1.1.0";
 
         internal static ManualLogSource Log;
         internal static Settings Cfg;
@@ -73,6 +73,9 @@ namespace BlackJacket.OptimalPlay
         public readonly ConfigEntry<bool> AutoPlay;
         public readonly ConfigEntry<float> ActionDelay;
         public readonly ConfigEntry<bool> AutoActivateOptionalEffects;
+        public readonly ConfigEntry<bool> AutoSelectInsight;
+        public readonly ConfigEntry<bool> AutoSelectDemand;
+        public readonly ConfigEntry<bool> AutoSelectShuffle;
         public readonly ConfigEntry<bool> LogDecisions;
         public readonly ConfigEntry<bool> ShowStatus;
         public readonly ConfigEntry<KeyboardShortcut> ToggleKey;
@@ -92,6 +95,15 @@ namespace BlackJacket.OptimalPlay
 
             AutoActivateOptionalEffects = file.Bind("General", "AutoActivateOptionalEffects", true,
                 "When a played card asks whether to activate its optional effect, choose Activate. If false, choose Skip.");
+
+            AutoSelectInsight = file.Bind("Automation", "AutoSelectInsight", true,
+                "Automatically reorder insight windows to the arrangement with the best solver outcome.");
+
+            AutoSelectDemand = file.Bind("Automation", "AutoSelectDemand", true,
+                "Automatically take the best card in demand windows, or skip when nothing helps.");
+
+            AutoSelectShuffle = file.Bind("Automation", "AutoSelectShuffle", true,
+                "Automatically choose which deck to shuffle when a shuffle effect asks.");
 
             LogDecisions = file.Bind("General", "LogDecisions", true,
                 "Log every decision and its evaluation to the BepInEx console/log.");

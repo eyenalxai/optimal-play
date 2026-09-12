@@ -31,6 +31,20 @@ tiebreak, the `Uprising` target reduction and the `Supper` pass restriction.
 The game is re-read and re-solved on every one of your turns, so card effects that change
 values on the fly are picked up as soon as they happen.
 
+## Automated selections
+
+The same solver answers the blocking choice screens:
+
+- **Insight** – reorders the revealed top cards of your deck (or of the opponent's deck)
+  to the arrangement with the best round outcome. Every arrangement the dialog allows is
+  scored, including burying cards below the rest of the deck with the placeholder.
+- **Demand** – takes the revealed card with the best round outcome into your sleeve
+  (free of charge) or skips when taking is worse than skipping.
+- **Shuffle** – when a shuffle effect asks which deck to shuffle, samples both options and
+  picks the one with the better expected outcome.
+
+Optional card-effect prompts are answered with `AutoActivateOptionalEffects`.
+
 ## Configuration
 
 `BepInEx/config/com.blackjacket.mods.optimalplay.cfg`
@@ -42,6 +56,9 @@ values on the fly are picked up as soon as they happen.
 | `ToggleKey` | `F8` | Toggles AutoPlay. |
 | `ActionDelay` | `0.5` | Seconds between actions, so animations/effects can finish. |
 | `AutoActivateOptionalEffects` | `true` | Answer optional card-effect prompts with Activate (else Skip). |
+| `AutoSelectInsight` | `true` | Reorder insight windows to the best arrangement. |
+| `AutoSelectDemand` | `true` | Take (or skip) the best card in demand windows. |
+| `AutoSelectShuffle` | `true` | Choose which deck to shuffle. |
 | `LogDecisions` | `true` | Write every decision with its evaluation to the log. |
 | `ShowStatus` | `true` | Small status line showing the current decision. |
 | `SearchNodeBudget` | `250000` | Maximum search nodes per decision. |
@@ -60,7 +77,7 @@ values on the fly are picked up as soon as they happen.
 - Card effects are only modeled through the values they have already applied; anything a
   played card does that is not reflected in the current values is re-evaluated on the
   next turn.
-- Choice dialogs (demands, card selections) are not answered; the bot waits while one is
-  open.
+- Insight windows with more than four revealed cards only permute the top four; the rest
+  keep their order to bound the search.
 - Shop, map and reward screens stay manual.
 - Auto-play is disabled during the tutorial.

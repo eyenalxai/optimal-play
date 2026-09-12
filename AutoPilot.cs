@@ -15,6 +15,7 @@ namespace BlackJacket.OptimalPlay
     {
         internal static bool PlayerInputActive;
 
+        private readonly AutoSelector _selector = new AutoSelector();
         private float _cooldown;
         private string _status = "";
         private TextMeshProUGUI _statusText;
@@ -79,6 +80,12 @@ namespace BlackJacket.OptimalPlay
                     }
                     _cooldown = Delay(cfg);
                 }
+                return;
+            }
+
+            if (_selector.Tick(gc, cfg))
+            {
+                SetStatus(_selector.Status);
                 return;
             }
 
@@ -202,6 +209,11 @@ namespace BlackJacket.OptimalPlay
 
             SetStatus($"AUTO: {Describe(move, sim)}  (P {ps.TableValue} vs O {gc.State.Opponent.TableValue})");
             ExecuteMove(gc, sim, move);
+        }
+
+        internal static SolverState Capture(GameController gc)
+        {
+            return BuildSim(gc, gc.State.Player);
         }
 
         private static SolverState BuildSim(GameController gc, PlayerState ps)
