@@ -12,7 +12,7 @@ namespace BlackJacket.OptimalPlay
     {
         public const string PluginGuid = "com.blackjacket.mods.optimalplay";
         public const string PluginName = "Black Jacket - Optimal Play";
-        public const string PluginVersion = "1.2.0";
+        public const string PluginVersion = "1.3.0";
 
         internal static ManualLogSource Log;
         internal static Settings Cfg;
@@ -22,9 +22,9 @@ namespace BlackJacket.OptimalPlay
             Log = Logger;
             Cfg = new Settings(Config);
 
+            var harmony = new Harmony(PluginGuid);
             try
             {
-                var harmony = new Harmony(PluginGuid);
                 harmony.PatchAll(typeof(PlayerInputPatches));
                 PlayerInputPatches.Patched = true;
                 Log.LogInfo("Player turn hooks installed.");
@@ -32,6 +32,16 @@ namespace BlackJacket.OptimalPlay
             catch (Exception e)
             {
                 Log.LogWarning($"Player turn hooks failed ({e.Message}); using fallback detection.");
+            }
+
+            try
+            {
+                harmony.PatchAll(typeof(CardChoicePatches));
+                Log.LogInfo("Card choice hooks installed.");
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning($"Card choice hooks failed ({e.Message}); table card choices stay manual.");
             }
 
             var go = new GameObject("OptimalPlay");
@@ -67,6 +77,28 @@ namespace BlackJacket.OptimalPlay
         }
     }
 
+    /// <summary>
+    /// Captures the candidate cards of a table card choice. ActiveCardChoice only exposes
+    /// IsActive and SetSelectedCard, so the effect's target list (e.g. "Sleeve a card from
+    /// your slots") is recorded when the choice starts and read by the selector.
+    /// </summary>
+    [HarmonyPatch]
+    internal static class CardChoicePatches
+    {
+        public static Card3D SourceCard;
+        public static Card3D[] Choices;
+        public static float StartedAt = -1f;
+
+        [HarmonyPatch(typeof(ActiveCardChoice), "BeginCardChoice")]
+        [HarmonyPrefix]
+        private static void BeginPrefix(Card3D sourceCard, Card3D[] validChoices)
+        {
+            SourceCard = sourceCard;
+            Choices = validChoices;
+            StartedAt = Time.realtimeSinceStartup;
+        }
+    }
+
     internal sealed class Settings
     {
         public readonly ConfigEntry<bool> Enabled;
@@ -76,6 +108,7 @@ namespace BlackJacket.OptimalPlay
         public readonly ConfigEntry<bool> AutoSelectInsight;
         public readonly ConfigEntry<bool> AutoSelectDemand;
         public readonly ConfigEntry<bool> AutoSelectShuffle;
+        public readonly ConfigEntry<bool> AutoSelectCardChoice;
         public readonly ConfigEntry<bool> LogDecisions;
         public readonly ConfigEntry<bool> LogState;
         public readonly ConfigEntry<bool> ShowStatus;
@@ -107,6 +140,10 @@ namespace BlackJacket.OptimalPlay
 
             AutoSelectShuffle = file.Bind("Automation", "AutoSelectShuffle", true,
                 "Automatically choose which deck to shuffle when a shuffle effect asks.");
+
+            AutoSelectCardChoice = file.Bind("Automation", "AutoSelectCardChoice", true,
+                "Automatically pick a card when an effect asks you to select one of your table cards, "
+                + "such as the awakened Greed 3 (\"Sleeve a card from your slots\").");
 
             LogDecisions = file.Bind("General", "LogDecisions", true,
                 "Log every decision and its evaluation to the BepInEx console/log.");

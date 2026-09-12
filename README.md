@@ -40,6 +40,9 @@ The same solver answers the blocking choice screens:
   scored, including burying cards below the rest of the deck with the placeholder.
 - **Demand** – takes the revealed card with the best round outcome into your sleeve
   (free of charge) or skips when taking is worse than skipping.
+- **Card choice** – when an effect such as the awakened Greed 3 (*"Sleeve a card from your
+  slots."*) makes you pick one of your own table cards, sleeves the candidate whose removal
+  leaves the best round outcome (usually a dead or least useful card).
 - **Shuffle** – when a shuffle effect asks which deck to shuffle, samples both options and
   picks the one with the better expected outcome.
 
@@ -58,6 +61,7 @@ Optional card-effect prompts are answered with `AutoActivateOptionalEffects`.
 | `AutoActivateOptionalEffects` | `true` | Answer optional card-effect prompts with Activate (else Skip). |
 | `AutoSelectInsight` | `true` | Reorder insight windows to the best arrangement. |
 | `AutoSelectDemand` | `true` | Take (or skip) the best card in demand windows. |
+| `AutoSelectCardChoice` | `true` | Pick the best card when an effect asks you to select one of your table cards (e.g. "Sleeve a card from your slots"). |
 | `AutoSelectShuffle` | `true` | Choose which deck to shuffle. |
 | `LogDecisions` | `true` | Write every decision with its evaluation to the log. |
 | `LogState` | `false` | Write a detailed state dump (both sides, cards, legal and illegal moves) for every decision. |
@@ -77,7 +81,12 @@ Decision: play top card Hearts_7_Upgraded[-7] | P 0 vs O 5 | ev -2 | 632 nodes |
 
 The `options:` list is every root move with what it is worth (in coins, same scale as the
 round result above). Cards are printed as `Name[values]`. `(budget reached, greedy fallback)`
-means the search ran out of time/nodes and the quick heuristic had to answer.
+means the search ran out of time/nodes and the quick heuristic had to answer. Selection
+dialogs log one line each, e.g.:
+
+```
+Card choice: sleeving Hearts_1_Upgraded[-1] (value +2; options: Hearts_1_Upgraded[-1]=+2, Copper_5[5]=-2).
+```
 
 For the full picture press `F9` at any time (also outside your turn): it writes the whole
 position (`match`, both sides, table, next cards in both draw piles, sleeve, discard), every
@@ -134,6 +143,8 @@ Two rules keep those cards from stalling the bot:
   next turn. In particular, awakened Hearts ("Break the opposing card.", "Mend each
   surrounding card.", "Exploit N.") are scored by their negative value only - the bot does
   not yet plan around their effects or slot positions.
+- Sleeving a card does not model triggers such as *"When you sleeve a card ..."* perks; the
+  sleeve contents, their order and the sleeve costs are modeled exactly.
 - Insight windows with more than four revealed cards only permute the top four; the rest
   keep their order to bound the search.
 - Shop, map and reward screens stay manual.

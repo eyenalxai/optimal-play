@@ -14,12 +14,15 @@ namespace BlackJacket.OptimalPlay
     ///   best solver outcome,
     /// - demand: takes the revealed card (into the sleeve) with the best solver outcome, or
     ///   skips when nothing helps,
+    /// - card choice: picks the table card with the best solver outcome when an effect such
+    ///   as the awakened Greed 3 forces the player to sleeve one of their slots,
     /// - shuffle: picks the deck to shuffle by comparing sampled outcomes of both choices.
     /// </summary>
     internal sealed class AutoSelector
     {
         private const float SettleSeconds = 1.25f;
         private const float TotalInsightSeconds = 1.5f;
+        private const float TotalChoiceSeconds = 2.5f;
         private const int MaxInsightCandidates = 160;
         private const int ShuffleSamples = 4;
 
@@ -34,6 +37,8 @@ namespace BlackJacket.OptimalPlay
         private bool _handled;
         private bool _shuffleDecided;
         private bool _shuffleOwnDeck;
+        private Card3D _choiceCard;
+        private float _choiceStartedAt = -1f;
         private string _status = "";
         private int _nodeBudget = 8000;
         private int _timeMs = 10;
@@ -71,6 +76,11 @@ namespace BlackJacket.OptimalPlay
                 HandleDemand(gc, cfg, gc.UI.DemandDialog);
                 return true;
             }
+            if (ActiveCardChoice.IsActive)
+            {
+                HandleCardChoice(gc, cfg);
+                return true;
+            }
 
             ResetDialog();
             HandleShuffleChoice(gc, cfg);
@@ -95,6 +105,8 @@ namespace BlackJacket.OptimalPlay
         {
             _openedAt = -1f;
             _handled = false;
+            _choiceCard = null;
+            _choiceStartedAt = -1f;
         }
 
         // ---------------------------------------------------------------- insight
@@ -394,6 +406,139 @@ namespace BlackJacket.OptimalPlay
                 sim.P.Sleeve.RemoveAt(0);
             }
             sim.P.Sleeve.Add(card);
+        }
+
+        // ---------------------------------------------------------------- table card choice
+
+        /// <summary>
+        /// Effects like the awakened Greed 3 ("Sleeve a card from your slots") block on a
+        /// choice between the player's table cards. The move is forced, so sleeve the card
+        /// whose removal leaves the best round outcome - usually the least useful one.
+        /// </summary>
+        private void HandleCardChoice(GameController gc, Settings cfg)
+        {
+            float started = CardChoicePatches.StartedAt;
+            if (started <= 0f)
+            {
+                _status = "card choice: waiting for candidates";
+                return;
+            }
+            if (started != _choiceStartedAt)
+            {
+                _choiceStartedAt = started;
+                _choiceCard = null;
+            }
+
+            if (!cfg.AutoSelectCardChoice.Value)
+            {
+                _status = "card choice: manual";
+                return;
+            }
+            if (Time.realtimeSinceStartup - started < SettleSeconds)
+            {
+                return;
+            }
+
+            Card3D[] choices = CardChoicePatches.Choices;
+            if (choices == null || choices.Length == 0)
+            {
+                return;
+            }
+
+            if (_choiceCard == null)
+            {
+                try
+                {
+                    _choiceCard = ChooseCard(gc, choices);
+                }
+                catch (Exception e)
+                {
+                    OptimalPlayPlugin.Log.LogWarning($"Card choice failed ({e.Message}); taking the first candidate.");
+                }
+                if (_choiceCard == null)
+                {
+                    _choiceCard = choices[0];
+                    _status = "card choice: fallback";
+                }
+            }
+
+            if (_choiceCard != null)
+            {
+                ActiveCardChoice.SetSelectedCard(_choiceCard);
+            }
+        }
+
+        private Card3D ChooseCard(GameController gc, Card3D[] choices)
+        {
+            SolverState baseState = AutoPilot.Capture(gc);
+            Card3D[] table = gc.State.Player.TableDropArea.Cards;
+            var solver = new RoundSolver
+            {
+                NodeBudget = Math.Max(1000, OptimalPlayPlugin.Cfg.SearchNodeBudget.Value),
+                TimeBudgetMs = Math.Max(20, OptimalPlayPlugin.Cfg.SearchTimeMs.Value),
+            };
+
+            // Sleeving a dead card is nearly always right, so evaluate the likely best
+            // candidates first; a timeout then cannot drop the best option.
+            var ordered = choices
+                .Where(c => c != null)
+                .Select(c => new { Card = c, Sim = SolverCard.From(c) })
+                .OrderBy(x => x.Sim.IsDead ? 0 : 1)
+                .ThenBy(x => x.Sim.Highest)
+                .ToArray();
+
+            var ranked = new List<(Card3D Card, SolverCard Sim, float Value)>();
+            float deadline = Time.realtimeSinceStartup + TotalChoiceSeconds;
+            foreach (var candidate in ordered)
+            {
+                int index = Array.IndexOf(table, candidate.Card);
+                if (index < 0 || index >= baseState.P.Table.Count)
+                {
+                    continue;
+                }
+
+                SolverState clone = baseState.Clone();
+                clone.P.Discard = new List<SolverCard>(baseState.P.Discard);
+                SolverCard moved = clone.P.Table[index];
+                clone.P.Table.RemoveAt(index);
+                if (!moved.IsHollow)
+                {
+                    // The vacated slot is usable again (a hollow card takes its own slot with it).
+                    clone.P.Capacity++;
+                }
+                AddToSleeve(clone, moved);
+                clone.InvalidateValues();
+
+                ranked.Add((candidate.Card, moved, solver.Evaluate(clone)));
+                if (Time.realtimeSinceStartup > deadline)
+                {
+                    break;
+                }
+            }
+            if (ranked.Count == 0)
+            {
+                return null;
+            }
+            ranked.Sort((a, b) =>
+            {
+                int cmp = b.Value.CompareTo(a.Value);
+                // Equal outcomes: keep the live cards and sleeve the dead one, so unmodeled
+                // effects have the better material to work with.
+                return cmp != 0 ? cmp : (a.Sim.IsDead ? 0 : 1).CompareTo(b.Sim.IsDead ? 0 : 1);
+            });
+
+            if (OptimalPlayPlugin.Cfg.LogDecisions.Value)
+            {
+                string source = CardChoicePatches.SourceCard != null
+                    ? SolverCard.From(CardChoicePatches.SourceCard).Name
+                    : "effect";
+                string options = string.Join(", ", ranked.Select(r => $"{r.Sim.Label}={Format(r.Value)}"));
+                OptimalPlayPlugin.Log.LogInfo(
+                    $"Card choice ({source}): sleeving {ranked[0].Sim.Label} (value {Format(ranked[0].Value)}; "
+                    + $"options: {options}).");
+            }
+            _status = $"card choice: sleeve {ranked[0].Sim.Label} (ev {Format(ranked[0].Value)})";
+            return ranked[0].Card;
         }
 
         // ---------------------------------------------------------------- shuffle
