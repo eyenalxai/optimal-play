@@ -60,9 +60,64 @@ Optional card-effect prompts are answered with `AutoActivateOptionalEffects`.
 | `AutoSelectDemand` | `true` | Take (or skip) the best card in demand windows. |
 | `AutoSelectShuffle` | `true` | Choose which deck to shuffle. |
 | `LogDecisions` | `true` | Write every decision with its evaluation to the log. |
+| `LogState` | `false` | Write a detailed state dump (both sides, cards, legal and illegal moves) for every decision. |
+| `DumpStateKey` | `F9` | Log the current position and full move analysis once, without acting. |
+| `VerboseKey` | `F10` | Toggle `LogState` at runtime. |
 | `ShowStatus` | `true` | Small status line showing the current decision. |
 | `SearchNodeBudget` | `250000` | Maximum search nodes per decision. |
 | `SearchTimeMs` | `200` | Maximum search time per decision. |
+
+## Reading the log
+
+`BepInEx/LogOutput.log` gets one line per decision when `LogDecisions` is on:
+
+```
+Decision: play top card Hearts_7_Upgraded[-7] | P 0 vs O 5 | ev -2 | 632 nodes | options: ...
+```
+
+The `options:` list is every root move with what it is worth (in coins, same scale as the
+round result above). Cards are printed as `Name[values]`. `(budget reached, greedy fallback)`
+means the search ran out of time/nodes and the quick heuristic had to answer.
+
+For the full picture press `F9` at any time (also outside your turn): it writes the whole
+position (`match`, both sides, table, next cards in both draw piles, sleeve, discard), every
+legal move with its value, and every unavailable move with the reason:
+
+```
+=== Optimal Play: F9 dump ===
+match: target 21, holds at 17, rules: none
+player: value 0, target 21, capacity 3, passed no, bet 2, sleeve draws 0/2, next sleeve cost 1, payable 3
+  table: (empty)
+  deck top: Hearts_7_Upgraded[-7] (Exploit 2.), Hearts_10[10], ...
+  discard: 12 cards
+  sleeve: Hearts_9_Upgraded[-9] (Mend each surrounding card.), Hearts_3_Upgraded[-3/-1]
+moves:
+  pass -> -2
+  play top card Hearts_7_Upgraded[-7] -> -2
+  sleeve top card Hearts_7_Upgraded[-7] -> -3
+result: pass | ev -2 | 632 nodes (complete)
+```
+
+`F10` toggles these dumps for every decision at runtime, so you do not have to restart the
+game after changing `LogState`.
+
+## Negative cards and dead cards
+
+Some cards really are worth negative numbers, by design - awakened Hearts, for example
+(the game itself says: *"Hearts have negative values when awakened, and can break other
+cards."*). A negative card's `values` in the log/solver are the game's current values, and
+the solver plays them exactly like the game scores them.
+
+Two rules keep those cards from stalling the bot:
+
+- **Progress tie-break.** Losing a round costs your bet no matter how you lose it. When every
+  move (including passing) is worth the same non-positive amount and the top card is a dead
+  card (best value <= 0), the bot plays/sleeves it instead of passing. Passing forever would
+  leave that card stuck on top of the draw pile and never reach the rest of the deck.
+- **Playing to the opponent's table.** Cards with *"Play into any slot."* (the game's
+  `CanBePlayedInOpponentsSlots`) can be dropped on the opponent's side; the solver considers
+  both sides and uses whichever is better. The search models the value change on either
+  table exactly, including the opponent's reaction.
 
 ## Install
 
@@ -76,7 +131,9 @@ Optional card-effect prompts are answered with `AutoActivateOptionalEffects`.
   shuffle and re-plans with the real order on the next turn.
 - Card effects are only modeled through the values they have already applied; anything a
   played card does that is not reflected in the current values is re-evaluated on the
-  next turn.
+  next turn. In particular, awakened Hearts ("Break the opposing card.", "Mend each
+  surrounding card.", "Exploit N.") are scored by their negative value only - the bot does
+  not yet plan around their effects or slot positions.
 - Insight windows with more than four revealed cards only permute the top four; the rest
   keep their order to bound the search.
 - Shop, map and reward screens stay manual.

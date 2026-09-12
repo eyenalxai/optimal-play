@@ -12,7 +12,7 @@ namespace BlackJacket.OptimalPlay
     {
         public const string PluginGuid = "com.blackjacket.mods.optimalplay";
         public const string PluginName = "Black Jacket - Optimal Play";
-        public const string PluginVersion = "1.1.0";
+        public const string PluginVersion = "1.2.0";
 
         internal static ManualLogSource Log;
         internal static Settings Cfg;
@@ -77,8 +77,11 @@ namespace BlackJacket.OptimalPlay
         public readonly ConfigEntry<bool> AutoSelectDemand;
         public readonly ConfigEntry<bool> AutoSelectShuffle;
         public readonly ConfigEntry<bool> LogDecisions;
+        public readonly ConfigEntry<bool> LogState;
         public readonly ConfigEntry<bool> ShowStatus;
         public readonly ConfigEntry<KeyboardShortcut> ToggleKey;
+        public readonly ConfigEntry<KeyboardShortcut> DumpStateKey;
+        public readonly ConfigEntry<KeyboardShortcut> VerboseKey;
         public readonly ConfigEntry<int> SearchNodeBudget;
         public readonly ConfigEntry<int> SearchTimeMs;
 
@@ -107,6 +110,15 @@ namespace BlackJacket.OptimalPlay
 
             LogDecisions = file.Bind("General", "LogDecisions", true,
                 "Log every decision and its evaluation to the BepInEx console/log.");
+
+            LogState = file.Bind("Diagnostics", "LogState", false,
+                "Log a detailed state dump (both sides, cards, legal and illegal moves) for every decision. Toggle at runtime with VerboseKey.");
+
+            DumpStateKey = file.Bind("Diagnostics", "DumpStateKey", new KeyboardShortcut(KeyCode.F9),
+                "Key that logs the current position plus a full move analysis without acting.");
+
+            VerboseKey = file.Bind("Diagnostics", "VerboseKey", new KeyboardShortcut(KeyCode.F10),
+                "Key that toggles detailed state logging at runtime.");
 
             ShowStatus = file.Bind("Display", "ShowStatus", true,
                 "Show a small status line with the current decision.");

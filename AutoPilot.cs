@@ -63,6 +63,24 @@ namespace BlackJacket.OptimalPlay
                 return;
             }
 
+            if (cfg.VerboseKey.Value.IsDown())
+            {
+                cfg.LogState.Value = !cfg.LogState.Value;
+                OptimalPlayPlugin.Log.LogInfo($"State dumps {(cfg.LogState.Value ? "enabled" : "disabled")}.");
+            }
+
+            if (cfg.DumpStateKey.Value.IsDown())
+            {
+                if (gc.CurrentMatch != null && gc.State.Player.DrawPile != null)
+                {
+                    DumpState(gc, "F9 dump");
+                }
+                else
+                {
+                    OptimalPlayPlugin.Log.LogInfo("State dump skipped: no match in progress.");
+                }
+            }
+
             if (OptionalCardActivation.IsActive)
             {
                 SetStatus("AUTO: choosing optional card effect");
@@ -168,12 +186,7 @@ namespace BlackJacket.OptimalPlay
         {
             Settings cfg = OptimalPlayPlugin.Cfg;
             SolverState sim = BuildSim(gc, ps);
-
-            var solver = new RoundSolver
-            {
-                NodeBudget = Mathf.Max(1000, cfg.SearchNodeBudget.Value),
-                TimeBudgetMs = Mathf.Max(20, cfg.SearchTimeMs.Value),
-            };
+            RoundSolver solver = MakeSolver(cfg);
 
             SolverMove move = solver.BestMove(sim, out float value, out int nodes, out bool aborted,
                 out List<MoveEvaluation> evaluations);
@@ -189,7 +202,7 @@ namespace BlackJacket.OptimalPlay
             if (cfg.LogDecisions.Value)
             {
                 var sb = new StringBuilder();
-                sb.Append("Decision: ").Append(Describe(move, sim));
+                sb.Append("Decision: ").Append(RoundSolver.MoveLabel(move, sim));
                 sb.Append(" | P ").Append(sim.PValue).Append(" vs O ").Append(sim.OValue);
                 if (!float.IsNaN(value))
                 {
@@ -200,15 +213,149 @@ namespace BlackJacket.OptimalPlay
                 {
                     sb.Append(" (budget reached, greedy fallback)");
                 }
+                if (solver.Note != null)
+                {
+                    sb.Append(" [").Append(solver.Note).Append(']');
+                }
                 sb.Append(" | options: ");
                 sb.Append(string.Join(", ",
                     evaluations.OrderByDescending(e => e.Value).Take(4)
-                        .Select(e => $"{Describe(e.Move, sim)}={e.Value:+0.##;-0.##;0}")));
+                        .Select(e => $"{RoundSolver.MoveLabel(e.Move, sim)}={e.Value:+0.##;-0.##;0}")));
                 OptimalPlayPlugin.Log.LogInfo(sb.ToString());
             }
 
-            SetStatus($"AUTO: {Describe(move, sim)}  (P {ps.TableValue} vs O {gc.State.Opponent.TableValue})");
+            if (cfg.LogState.Value)
+            {
+                var sb = new StringBuilder();
+                AppendReport(sb, "decision", sim, solver, move, value, nodes, aborted, evaluations);
+                OptimalPlayPlugin.Log.LogInfo(sb.ToString());
+            }
+
+            SetStatus($"AUTO: {RoundSolver.MoveLabel(move, sim)}  (P {ps.TableValue} vs O {gc.State.Opponent.TableValue})");
             ExecuteMove(gc, sim, move);
+        }
+
+        private static RoundSolver MakeSolver(Settings cfg)
+        {
+            return new RoundSolver
+            {
+                NodeBudget = Mathf.Max(1000, cfg.SearchNodeBudget.Value),
+                TimeBudgetMs = Mathf.Max(20, cfg.SearchTimeMs.Value),
+            };
+        }
+
+        /// <summary>Log the current position and what the solver would do, without acting.</summary>
+        private void DumpState(GameController gc, string source)
+        {
+            SolverState sim = BuildSim(gc, gc.State.Player);
+            RoundSolver solver = MakeSolver(OptimalPlayPlugin.Cfg);
+            SolverMove move = solver.BestMove(sim, out float value, out int nodes, out bool aborted,
+                out List<MoveEvaluation> evaluations);
+            var sb = new StringBuilder();
+            AppendReport(sb, source, sim, solver, move, value, nodes, aborted, evaluations);
+            OptimalPlayPlugin.Log.LogInfo(sb.ToString());
+        }
+
+        private static void AppendReport(StringBuilder sb, string source, SolverState sim, RoundSolver solver,
+            SolverMove move, float value, int nodes, bool aborted, List<MoveEvaluation> evaluations)
+        {
+            sb.Append("=== Optimal Play: ").Append(source).AppendLine(" ===");
+            sb.Append("match: target ").Append(sim.PlainTarget)
+                .Append(", holds at ").Append(sim.HoldsAt)
+                .Append(", rules: ").Append(Rules(sim)).AppendLine();
+            AppendSide(sb, "player", sim, sim.P, sim.PValue, sim.PTarget);
+            AppendSide(sb, "opponent", sim, sim.O, sim.OValue, sim.OTarget);
+            sb.AppendLine("moves:");
+            sb.Append(solver.DescribeMoves(sim, evaluations));
+            sb.Append("result: ").Append(RoundSolver.MoveLabel(move, sim));
+            if (!float.IsNaN(value))
+            {
+                sb.Append(" | ev ").Append(value.ToString("+0.##;-0.##;0"));
+            }
+            sb.Append(" | ").Append(nodes).Append(" nodes");
+            sb.Append(aborted ? " (budget reached, greedy fallback)" : " (complete)");
+            if (solver.Note != null)
+            {
+                sb.Append(" [").Append(solver.Note).Append(']');
+            }
+            sb.AppendLine();
+        }
+
+        private static string Rules(SolverState sim)
+        {
+            var rules = new List<string>();
+            if (sim.Uprising)
+            {
+                rules.Add("Uprising");
+            }
+            if (sim.Supper)
+            {
+                rules.Add("Supper");
+            }
+            return rules.Count == 0 ? "none" : string.Join(", ", rules);
+        }
+
+        private static void AppendSide(StringBuilder sb, string label, SolverState sim, SolverSide side,
+            int value, int target)
+        {
+            sb.Append(label).Append(": value ").Append(value)
+                .Append(", target ").Append(target)
+                .Append(", capacity ").Append(side.Capacity)
+                .Append(", passed ").Append(side.Passed ? "yes" : "no")
+                .Append(", bet ").Append(side.Bet);
+            if (ReferenceEquals(side, sim.P))
+            {
+                sb.Append(", sleeve draws ").Append(side.SleeveDraws).Append('/').Append(sim.SleeveSize)
+                    .Append(", next sleeve cost ").Append(NextSleeveCost(sim, side))
+                    .Append(", payable ").Append(sim.Payable);
+            }
+            else
+            {
+                sb.Append(", insight ").Append(sim.InsightLeft);
+            }
+            sb.AppendLine();
+            sb.Append("  table: ").AppendLine(CardList(side.Table, int.MaxValue));
+            sb.Append("  deck top: ").AppendLine(CardList(side.Deck, side.DeckPos, 6));
+            sb.Append("  discard: ").Append(side.Discard.Count).AppendLine(" cards");
+            sb.Append("  sleeve: ").AppendLine(CardList(side.Sleeve, int.MaxValue));
+        }
+
+        private static string NextSleeveCost(SolverState sim, SolverSide side)
+        {
+            if (sim.SleeveCosts == null || sim.SleeveCosts.Length == 0)
+            {
+                return "n/a";
+            }
+            return sim.SleeveCosts[Math.Min(sim.SleeveCosts.Length - 1, side.SleeveDraws)].ToString();
+        }
+
+        private static string CardList(List<SolverCard> cards, int max)
+        {
+            return CardList(cards, 0, max);
+        }
+
+        private static string CardList(List<SolverCard> cards, int start, int max)
+        {
+            if (cards.Count <= start)
+            {
+                return "(empty)";
+            }
+            var parts = new List<string>();
+            for (int i = start; i < cards.Count && parts.Count < max; i++)
+            {
+                SolverCard card = cards[i];
+                string part = card.Label;
+                if (card.Effect != null)
+                {
+                    part += " (" + card.Effect + ")";
+                }
+                parts.Add(part);
+            }
+            if (cards.Count - start > max)
+            {
+                parts.Add("+" + (cards.Count - start - max) + " more");
+            }
+            return string.Join(", ", parts);
         }
 
         internal static SolverState Capture(GameController gc)
@@ -286,28 +433,6 @@ namespace BlackJacket.OptimalPlay
             return side;
         }
 
-        private static string Describe(SolverMove move, SolverState sim)
-        {
-            switch (move.Kind)
-            {
-                case MoveKind.PlayTop:
-                    return $"play top card [{Values(sim.P.Top)}]";
-                case MoveKind.SleeveTop:
-                    return $"sleeve top card [{Values(sim.P.Top)}]";
-                case MoveKind.PlaySleeve:
-                    return move.SleeveIndex >= 0 && move.SleeveIndex < sim.P.Sleeve.Count
-                        ? $"play sleeve card [{Values(sim.P.Sleeve[move.SleeveIndex])}]"
-                        : "play sleeve card";
-                default:
-                    return "pass";
-            }
-        }
-
-        private static string Values(SolverCard card)
-        {
-            return card == null ? "?" : string.Join("/", card.Values.Select(v => v.ToString()));
-        }
-
         // ---------------------------------------------------------------- execution
 
         private void ExecuteMove(GameController gc, SolverState sim, SolverMove move)
@@ -328,7 +453,7 @@ namespace BlackJacket.OptimalPlay
                         return;
                     }
                     CardPlacementController.PickupCard(card, ui.Player.DrawPile, InputType.KeyboardAndMouse);
-                    if (!DropToTable(card))
+                    if (!DropToTable(card, move.ToOpponent))
                     {
                         CardPlacementController.ReturnCard();
                         PressPass(gc);
@@ -372,7 +497,7 @@ namespace BlackJacket.OptimalPlay
                         return;
                     }
                     CardPlacementController.PickupCard(card, ui.Sleeve, InputType.KeyboardAndMouse);
-                    if (!DropToTable(card))
+                    if (!DropToTable(card, move.ToOpponent))
                     {
                         CardPlacementController.ReturnCard();
                         PressPass(gc);
@@ -396,10 +521,12 @@ namespace BlackJacket.OptimalPlay
             ExecuteMove(gc, copy, move);
         }
 
-        private static bool DropToTable(Card3D card)
+        private static bool DropToTable(Card3D card, bool toOpponent)
         {
-            List<SingleCardField> areas = CardPlacementController.FindAvailablePlayerDropAreas(card);
-            if (areas.Count == 0)
+            List<SingleCardField> areas = toOpponent
+                ? CardPlacementController.FindAvailableOpponentDropAreas(card)
+                : CardPlacementController.FindAvailablePlayerDropAreas(card);
+            if (!toOpponent && areas.Count == 0)
             {
                 areas = CardPlacementController.FindAvailableOpponentDropAreas(card);
             }

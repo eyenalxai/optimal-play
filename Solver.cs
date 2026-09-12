@@ -17,6 +17,7 @@ namespace BlackJacket.OptimalPlay
     {
         public MoveKind Kind;
         public int SleeveIndex;
+        public bool ToOpponent;
 
         public string Label
         {
@@ -24,9 +25,9 @@ namespace BlackJacket.OptimalPlay
             {
                 switch (Kind)
                 {
-                    case MoveKind.PlayTop: return "play top card";
+                    case MoveKind.PlayTop: return ToOpponent ? "play top card to opponent" : "play top card";
                     case MoveKind.SleeveTop: return "sleeve top card";
-                    case MoveKind.PlaySleeve: return "play sleeve card";
+                    case MoveKind.PlaySleeve: return ToOpponent ? "play sleeve card to opponent" : "play sleeve card";
                     default: return "pass";
                 }
             }
@@ -49,12 +50,41 @@ namespace BlackJacket.OptimalPlay
         public int Highest;
         public bool IsHollow;
         public bool AlwaysInsight;
+        public bool CanPlayOpponent;
+        public bool Broken;
+        public string Name;
+        public string Effect;
         public string Sig;
+
+        /// <summary>A card whose best possible contribution is zero or less (e.g. an awakened Heart).</summary>
+        public bool IsDead
+        {
+            get
+            {
+                int best = int.MinValue;
+                foreach (int v in Values)
+                {
+                    if (v > best)
+                    {
+                        best = v;
+                    }
+                }
+                return best <= 0;
+            }
+        }
+
+        /// <summary>Short human readable label, e.g. "Hearts_7_Upgraded[-7]".</summary>
+        public string Label => $"{Name}[{string.Join("/", Values)}]";
 
         public static SolverCard From(Card3D card)
         {
             GameCard gc = card.GameCard;
             int[] values = gc.Values;
+            string name = gc.name ?? "card";
+            if (name.StartsWith("GameCard_"))
+            {
+                name = name.Substring("GameCard_".Length);
+            }
             return new SolverCard
             {
                 Values = values,
@@ -62,7 +92,16 @@ namespace BlackJacket.OptimalPlay
                 Highest = gc.HighestValue,
                 IsHollow = gc.IsHollow,
                 AlwaysInsight = gc.OpponentAlwaysHasInsightOnThisCard,
-                Sig = (gc.Id == "ace" ? "a" : "n") + ":" + string.Join("|", values),
+                CanPlayOpponent = gc.CanBePlayedInOpponentsSlots,
+                Broken = values.Any(v => v < 0),
+                Name = name,
+                Effect = string.IsNullOrEmpty(gc.EffectText) ? null : gc.EffectText.Replace("\n", " "),
+                Sig = (gc.Id == "ace" ? "a" : "n")
+                    + (gc.IsHollow ? "h" : "")
+                    + (gc.OpponentAlwaysHasInsightOnThisCard ? "i" : "")
+                    + (gc.CanBePlayedInOpponentsSlots ? "o" : "")
+                    + (values.Any(v => v < 0) ? "b" : "")
+                    + ":" + string.Join("|", values),
             };
         }
     }
@@ -119,15 +158,48 @@ namespace BlackJacket.OptimalPlay
         public SolverSide P = new SolverSide();
         public SolverSide O = new SolverSide();
 
+        // Table/capacity are the only inputs of these values that change during a search,
+        // and recomputing them (which enumerates every value combination) is the hot path.
+        private int? _pValue;
+        private int? _oValue;
+
         public int PTarget => PlainTarget + PMods - (Uprising ? P.Capacity * 2 : 0);
         public int OTarget => PlainTarget + OMods - (Uprising ? O.Capacity * 2 : 0);
 
-        public int PValue => RoundSolver.Total(P.Table, PTarget) + PMods;
-        public int OValue => RoundSolver.Total(O.Table, OTarget) + OMods;
+        public int PValue
+        {
+            get
+            {
+                if (!_pValue.HasValue)
+                {
+                    _pValue = RoundSolver.Total(P.Table, PTarget) + PMods;
+                }
+                return _pValue.Value;
+            }
+        }
+
+        public int OValue
+        {
+            get
+            {
+                if (!_oValue.HasValue)
+                {
+                    _oValue = RoundSolver.Total(O.Table, OTarget) + OMods;
+                }
+                return _oValue.Value;
+            }
+        }
+
         public bool PBusted => PValue > PlainTarget;
         public bool OBusted => OValue > PlainTarget;
         public bool PBJ => RoundSolver.HasBlackJack(P.Table);
         public bool OBJ => RoundSolver.HasBlackJack(O.Table);
+
+        public void InvalidateValues()
+        {
+            _pValue = null;
+            _oValue = null;
+        }
 
         public SolverState Clone()
         {
@@ -143,6 +215,8 @@ namespace BlackJacket.OptimalPlay
                 Payable = Payable,
                 Uprising = Uprising,
                 Supper = Supper,
+                _pValue = _pValue,
+                _oValue = _oValue,
                 P = P.Clone(),
                 O = O.Clone(),
             };
@@ -176,6 +250,9 @@ namespace BlackJacket.OptimalPlay
         private readonly StringBuilder _sb = new StringBuilder(256);
         private readonly List<SolverCard> _sortScratch = new List<SolverCard>();
 
+        /// <summary>Set when the last decision needed a heuristic nudge (for logging).</summary>
+        public string Note { get; private set; }
+
         public SolverMove BestMove(SolverState root, out float value, out int nodes, out bool aborted,
             out List<MoveEvaluation> evaluations)
         {
@@ -184,6 +261,7 @@ namespace BlackJacket.OptimalPlay
             _aborted = false;
             _startMs = Environment.TickCount;
             evaluations = new List<MoveEvaluation>();
+            Note = null;
 
             SolverMove best = new SolverMove { Kind = MoveKind.Pass };
             float bestValue = float.NegativeInfinity;
@@ -213,8 +291,55 @@ namespace BlackJacket.OptimalPlay
             {
                 best = GreedyMove(root);
                 value = float.NaN;
+                return best;
+            }
+
+            // Deck-progress tie-break: losing a round costs the bet no matter how it is lost,
+            // so when the round is lost (or drawn) and passing ties with playing, cycle a dead
+            // card instead of freezing the deck on it. Passing forever would otherwise leave
+            // a stuck negative card (e.g. an awakened Heart) on top of the draw pile.
+            if (best.Kind == MoveKind.Pass && bestValue <= 0.0001f)
+            {
+                SolverMove progress = ProgressMove(root, evaluations, bestValue);
+                if (progress.Kind != MoveKind.Pass)
+                {
+                    best = progress;
+                    Note = "progress tie-break: played a dead card instead of passing";
+                }
             }
             return best;
+        }
+
+        private static SolverMove ProgressMove(SolverState root, List<MoveEvaluation> evaluations, float best)
+        {
+            const float eps = 0.0001f;
+            SolverMove sleeve = default;
+            bool hasSleeve = false;
+            foreach (MoveEvaluation e in evaluations)
+            {
+                if (e.Value < best - eps)
+                {
+                    continue;
+                }
+                switch (e.Move.Kind)
+                {
+                    case MoveKind.PlayTop:
+                        if (root.P.Top != null && root.P.Top.IsDead)
+                        {
+                            return e.Move;
+                        }
+                        break;
+                    case MoveKind.PlaySleeve:
+                        if (e.Move.SleeveIndex >= 0 && e.Move.SleeveIndex < root.P.Sleeve.Count
+                            && root.P.Sleeve[e.Move.SleeveIndex].IsDead && !hasSleeve)
+                        {
+                            sleeve = e.Move;
+                            hasSleeve = true;
+                        }
+                        break;
+                }
+            }
+            return hasSleeve ? sleeve : new SolverMove { Kind = MoveKind.Pass };
         }
 
         /// <summary>
@@ -378,27 +503,66 @@ namespace BlackJacket.OptimalPlay
                 {
                     n.P.Capacity++;
                 }
+                n.InvalidateValues();
                 moves.Add(new MoveState { Move = new SolverMove { Kind = MoveKind.PlayTop }, State = n });
             }
+            if (top != null && top.CanPlayOpponent && s.O.Capacity > 0)
+            {
+                SolverState n = s.Clone();
+                n.P.DeckPos++;
+                n.O.Table.Add(top);
+                n.O.Capacity--;
+                if (top.IsHollow)
+                {
+                    n.O.Capacity++;
+                }
+                n.InvalidateValues();
+                moves.Add(new MoveState
+                {
+                    Move = new SolverMove { Kind = MoveKind.PlayTop, ToOpponent = true },
+                    State = n,
+                });
+            }
 
-            if (s.P.Capacity > 0)
+            if (s.P.Capacity > 0 || s.O.Capacity > 0)
             {
                 for (int i = 0; i < s.P.Sleeve.Count; i++)
                 {
                     SolverCard card = s.P.Sleeve[i];
-                    SolverState n = s.Clone();
-                    n.P.Sleeve.RemoveAt(i);
-                    n.P.Table.Add(card);
-                    n.P.Capacity--;
-                    if (card.IsHollow)
+                    if (s.P.Capacity > 0)
                     {
-                        n.P.Capacity++;
+                        SolverState n = s.Clone();
+                        n.P.Sleeve.RemoveAt(i);
+                        n.P.Table.Add(card);
+                        n.P.Capacity--;
+                        if (card.IsHollow)
+                        {
+                            n.P.Capacity++;
+                        }
+                        n.InvalidateValues();
+                        moves.Add(new MoveState
+                        {
+                            Move = new SolverMove { Kind = MoveKind.PlaySleeve, SleeveIndex = i },
+                            State = n,
+                        });
                     }
-                    moves.Add(new MoveState
+                    if (card.CanPlayOpponent && s.O.Capacity > 0)
                     {
-                        Move = new SolverMove { Kind = MoveKind.PlaySleeve, SleeveIndex = i },
-                        State = n,
-                    });
+                        SolverState n = s.Clone();
+                        n.P.Sleeve.RemoveAt(i);
+                        n.O.Table.Add(card);
+                        n.O.Capacity--;
+                        if (card.IsHollow)
+                        {
+                            n.O.Capacity++;
+                        }
+                        n.InvalidateValues();
+                        moves.Add(new MoveState
+                        {
+                            Move = new SolverMove { Kind = MoveKind.PlaySleeve, SleeveIndex = i, ToOpponent = true },
+                            State = n,
+                        });
+                    }
                 }
             }
 
@@ -479,6 +643,7 @@ namespace BlackJacket.OptimalPlay
             {
                 o.Capacity++;
             }
+            s.InvalidateValues();
             s.InsightLeft = Math.Max(0, s.InsightLeft - 1);
         }
 
@@ -606,12 +771,20 @@ namespace BlackJacket.OptimalPlay
 
         // ---------------------------------------------------------------- helpers
 
+        // Total() is called in a tight loop; the buffers are reused to avoid one HashSet
+        // allocation per card per node. Nothing calls Total() reentrantly.
+        [ThreadStatic] private static HashSet<int> _sumsBufferA;
+        [ThreadStatic] private static HashSet<int> _sumsBufferB;
+
         internal static int Total(List<SolverCard> cards, int target)
         {
-            var sums = new HashSet<int> { 0 };
+            HashSet<int> sums = _sumsBufferA ?? (_sumsBufferA = new HashSet<int>());
+            HashSet<int> next = _sumsBufferB ?? (_sumsBufferB = new HashSet<int>());
+            sums.Clear();
+            sums.Add(0);
             foreach (SolverCard card in cards)
             {
-                var next = new HashSet<int>();
+                next.Clear();
                 foreach (int sum in sums)
                 {
                     foreach (int value in card.Values)
@@ -619,7 +792,9 @@ namespace BlackJacket.OptimalPlay
                         next.Add(sum + value);
                     }
                 }
+                HashSet<int> swap = sums;
                 sums = next;
+                next = swap;
             }
 
             int bestBelow = int.MinValue;
@@ -649,8 +824,19 @@ namespace BlackJacket.OptimalPlay
             }
             SolverCard a = cards[0];
             SolverCard b = cards[1];
-            return (a.IsAce && b.Values.Any(v => v == 10))
-                || (b.IsAce && a.Values.Any(v => v == 10));
+            return (a.IsAce && HasValue(b, 10)) || (b.IsAce && HasValue(a, 10));
+        }
+
+        private static bool HasValue(SolverCard card, int value)
+        {
+            foreach (int v in card.Values)
+            {
+                if (v == value)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         private static int Highest(List<SolverCard> cards)
@@ -738,6 +924,99 @@ namespace BlackJacket.OptimalPlay
             }
 
             return new SolverMove { Kind = MoveKind.Pass };
+        }
+
+        // ---------------------------------------------------------------- reporting
+
+        /// <summary>Human readable label for a move against a specific root state.</summary>
+        internal static string MoveLabel(SolverMove move, SolverState s)
+        {
+            switch (move.Kind)
+            {
+                case MoveKind.PlayTop:
+                    return "play top card " + Label(s.P.Top) + (move.ToOpponent ? " to opponent" : "");
+                case MoveKind.SleeveTop:
+                    return "sleeve top card " + Label(s.P.Top);
+                case MoveKind.PlaySleeve:
+                    SolverCard card = move.SleeveIndex >= 0 && move.SleeveIndex < s.P.Sleeve.Count
+                        ? s.P.Sleeve[move.SleeveIndex]
+                        : null;
+                    return "play sleeve card " + Label(card) + (move.ToOpponent ? " to opponent" : "");
+                default:
+                    return "pass";
+            }
+        }
+
+        private static string Label(SolverCard card)
+        {
+            return card == null ? "?" : card.Label;
+        }
+
+        private static string Format(float v)
+        {
+            return v.ToString("+0.##;-0.##;0");
+        }
+
+        /// <summary>
+        /// Multi-line report of every legal root move with its evaluated value plus the
+        /// actions that are unavailable, with the exact reason. Used by the diagnostics dump.
+        /// </summary>
+        internal string DescribeMoves(SolverState root, List<MoveEvaluation> evaluations)
+        {
+            var sb = new StringBuilder();
+            List<MoveState> legal = EnumerateMoves(root);
+            for (int i = 0; i < legal.Count; i++)
+            {
+                sb.Append("  ").Append(MoveLabel(legal[i].Move, root));
+                if (i < evaluations.Count)
+                {
+                    sb.Append(" -> ").Append(Format(evaluations[i].Value));
+                }
+                else
+                {
+                    sb.Append(" -> not evaluated");
+                }
+                sb.AppendLine();
+            }
+
+            if (!CanPass(root))
+            {
+                sb.AppendLine("  pass -> illegal (Supper: only allowed when the table has no free slot)");
+            }
+            if (root.P.Top == null)
+            {
+                sb.AppendLine("  play top / sleeve top -> unavailable (draw pile empty)");
+            }
+            if (root.P.Capacity <= 0)
+            {
+                sb.AppendLine("  play to own table -> unavailable (table full)");
+            }
+            if (root.P.Top != null && root.P.Top.CanPlayOpponent && root.O.Capacity <= 0)
+            {
+                sb.AppendLine("  play to opponent -> unavailable (opponent table full)");
+            }
+            if (!CanSleeve(root))
+            {
+                string why;
+                if (root.SleeveSize <= 0)
+                {
+                    why = "sleeve size 0";
+                }
+                else if (root.P.Top == null)
+                {
+                    why = "draw pile empty";
+                }
+                else if (root.Payable < SleeveCost(root))
+                {
+                    why = $"cannot pay (payable {root.Payable} < cost {SleeveCost(root)})";
+                }
+                else
+                {
+                    why = "unavailable";
+                }
+                sb.Append("  sleeve top -> unavailable (").Append(why).AppendLine(")");
+            }
+            return sb.ToString();
         }
 
         // ---------------------------------------------------------------- memo keys
