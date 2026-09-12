@@ -455,7 +455,7 @@ namespace BlackJacket.OptimalPlay
             }
 
             EnsureOverlay();
-            if (_statusCanvas == null)
+            if (_statusCanvas == null || _statusText == null)
             {
                 return;
             }
