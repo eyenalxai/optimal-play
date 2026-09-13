@@ -12,7 +12,7 @@ namespace BlackJacket.OptimalPlay
     {
         public const string PluginGuid = "com.blackjacket.mods.optimalplay";
         public const string PluginName = "Black Jacket - Optimal Play";
-        public const string PluginVersion = "2.2.2";
+        public const string PluginVersion = "2.2.3";
 
         internal static ManualLogSource Log;
         internal static Settings Cfg;

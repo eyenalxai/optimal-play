@@ -149,10 +149,9 @@ Two rules keep those cards from stalling the bot:
 - **Progress tie-break.** Losing a round costs your bet no matter how you lose it. When every
   move (including passing) is worth the same non-positive amount, the bot plays a card
   rather than passing: a dead top card (best value <= 0) cycles the deck first, then any
-  top or sleeve-top play that ties the value (both advance the deck), then a dead sleeve
-  card, and once the draw pile is empty any sleeve play that actually removes the card. A
-  card that duplicates itself back into the sleeve is never chosen by this rule, so it
-  cannot be played every turn.
+  sleeve play that actually removes the card from the sleeve, then a top or sleeve-top
+  play that advances the draw pile. A card that duplicates itself back into the sleeve is
+  never chosen by this rule, so it cannot be played every turn.
 - **Playing to the opponent's table.** Cards with *"Play into any slot."* (the game's
   `CanBePlayedInOpponentsSlots`) can be dropped on the opponent's side; the solver considers
   both sides and uses whichever is better. The search models the value change on either

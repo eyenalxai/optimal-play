@@ -1108,18 +1108,16 @@ fn greedy_move(s: &State) -> Move {
 }
 
 /// Progress nudge: among the moves that tie the best (non-positive) value, prefer
-/// playing over passing so the position keeps moving. A dead top card cycles the deck;
-/// any top or sleeve play that advances the deck is next, so a lost round never freezes
-/// on a pass while cards remain. A dead sleeve card clears the sleeve, and when the draw
-/// pile is already empty any sleeve play that removes the card qualifies. A card that
-/// puts itself back into the sleeve is never chosen by this rule, since it would be
-/// played every turn.
+/// playing over passing so the position keeps moving. A dead top card cycles the deck
+/// first; then sleeve plays that actually remove a card from the sleeve (a sleeve card
+/// left idle in a decided round is wasted either way); then a play top or sleeve top
+/// that advances the draw pile. A card that puts itself back into the sleeve is never
+/// chosen by this rule, since it would be played every turn.
 fn progress_move(root: &State, evaluations: &[Eval], best: f32) -> Move {
     const EPS: f32 = 0.0001;
-    let deck_empty = root.p.top().is_none();
     let mut progress = None;
     let mut dead: SmallVec<[Move; 8]> = SmallVec::new();
-    let mut other: SmallVec<[Move; 8]> = SmallVec::new();
+    let mut alive: SmallVec<[Move; 8]> = SmallVec::new();
 
     for eval in evaluations {
         if eval.value < best - EPS {
@@ -1148,8 +1146,8 @@ fn progress_move(root: &State, evaluations: &[Eval], best: f32) -> Move {
                 {
                     if card.is_dead() {
                         dead.push(eval.mv);
-                    } else if deck_empty {
-                        other.push(eval.mv);
+                    } else {
+                        alive.push(eval.mv);
                     }
                 }
             }
@@ -1157,13 +1155,13 @@ fn progress_move(root: &State, evaluations: &[Eval], best: f32) -> Move {
         }
     }
 
-    if let Some(mv) = progress {
-        return mv;
-    }
-    for mv in dead.into_iter().chain(other) {
+    for mv in dead.into_iter().chain(alive) {
         if sleeve_play_removes_card(root, mv) {
             return mv;
         }
+    }
+    if let Some(mv) = progress {
+        return mv;
     }
     Move::pass()
 }
