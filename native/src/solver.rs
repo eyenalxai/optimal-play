@@ -1,10 +1,11 @@
 //! Perfect-information search over one draw phase round.
 //!
-//! A round is a DAG: every action either advances a deck position or moves a card,
-//! and the opponent follows a deterministic policy. The solver therefore does a full
-//! backward induction with memoization and returns the move with the best coin
-//! outcome (win = opponent's bet, loss = own bet, tie = 0, sleeve costs are booked
-//! into the own bet exactly like the game does).
+//! A round is a DAG *unless a card effect creates cards or shuttles them between a
+//! sleeve and a table*: a hollow card that duplicates itself back into the sleeve can be
+//! played forever, so the game tree is not guaranteed to be finite. The search therefore
+//! bounds every line by recursion depth and by actions that made no deck progress; when a
+//! cap is hit the line is scored with [`resolve`], which is the same horizon the node and
+//! time budgets use. Legitimate rounds finish far below both caps.
 //!
 //! This is a 1:1 port of the managed solver that used to live in `Solver.cs`, so the
 //! two implementations can be diffed move by move while the port settles.
@@ -19,9 +20,47 @@ use crate::model::{Card, State, TRIGGER_RESOLUTION_AFTER, TRIGGER_RESOLUTION_BEF
 use crate::total::{highest, total};
 use crate::{effects, model};
 
-/// A round's root has at most a few dozen moves (sleeve cards, both tables, pass), so the
-/// move list never touches the heap in practice.
-type MoveList = SmallVec<[(Move, State); 16]>;
+/// Longest line the search follows, in player decisions. Beyond this the state is scored
+/// at the horizon. Only effect loops that keep creating table cards can reach it.
+const MAX_DEPTH: u32 = 2048;
+/// Player decisions allowed without the draw pile of either side advancing. A sleeve
+/// card that keeps returning to the sleeve would otherwise recurse forever; a real round
+/// cannot stall this long, since sleeves hold a handful of cards.
+const MAX_STALL: u32 = 96;
+
+/// Per-line budget carried through the recursion: `depth` counts player decisions,
+/// `stall` counts decisions since either deck position last moved.
+#[derive(Clone, Copy)]
+struct Ply {
+    depth: u32,
+    stall: u32,
+}
+
+impl Ply {
+    const ROOT: Ply = Ply { depth: 0, stall: 0 };
+
+    /// The next player decision, reached by applying a move to `parent`.
+    fn next(self, parent: &State, child: &State) -> Ply {
+        let advanced =
+            child.p.deck_pos != parent.p.deck_pos || child.o.deck_pos != parent.o.deck_pos;
+        Ply {
+            depth: self.depth + 1,
+            stall: if advanced { 0 } else { self.stall + 1 },
+        }
+    }
+
+    /// The next player decision after the opponent ran its policy.
+    fn after_opponent(self, advanced: bool) -> Ply {
+        Ply {
+            depth: self.depth + 1,
+            stall: if advanced { 0 } else { self.stall + 1 },
+        }
+    }
+
+    fn cut(self) -> bool {
+        self.depth >= MAX_DEPTH || self.stall >= MAX_STALL
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MoveKind {
@@ -80,11 +119,14 @@ pub struct Eval {
     pub value: f32,
 }
 
-/// Why a root move got a heuristic nudge; surfaced in the plugin log.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Note {
-    None,
-    ProgressTieBreak,
+/// Heuristic nudges and search-limit flags of a root result; surfaced in the plugin log.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct Note {
+    /// The chosen move was swapped for the progress tie-break (a dead card over a pass).
+    pub progress_tie_break: bool,
+    /// An effect loop forced the search to score a line at the depth or stall cap;
+    /// values below that point are horizon estimates.
+    pub depth_capped: bool,
 }
 
 /// Why "sleeve top" is or is not a legal root move; the plugin turns this into text.
@@ -97,22 +139,41 @@ pub enum SleeveReason {
     Unavailable,
 }
 
-/// One action of the expected line of play behind the chosen move.
+/// One action of the expected line of play behind the chosen move, plus the position
+/// right after it. The numbers make effect-driven changes visible in the plugin log:
+/// card effects can move coins between stash and bet or change table values without a
+/// corresponding player move.
 #[derive(Clone, Copy)]
-pub enum TraceStep {
-    Player {
-        mv: Move,
-        card: Option<Card>,
-    },
-    OpponentDraw {
-        card: Card,
-    },
+pub struct TraceStep {
+    pub action: TraceAction,
+    pub p_value: i32,
+    pub o_value: i32,
+    pub p_bet: i32,
+    pub o_bet: i32,
+    pub p_stash: i32,
+    pub o_stash: i32,
+}
+
+impl TraceStep {
+    fn after(action: TraceAction, s: &State) -> Self {
+        TraceStep {
+            action,
+            p_value: s.p_value(),
+            o_value: s.o_value(),
+            p_bet: s.p.bet,
+            o_bet: s.o.bet,
+            p_stash: s.p.stash,
+            o_stash: s.o.stash,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum TraceAction {
+    Player { mv: Move, card: Option<Card> },
+    OpponentDraw { card: Card },
     OpponentPass,
-    Resolve {
-        winner: i32,
-        p_value: i32,
-        o_value: i32,
-    },
+    Resolve { winner: i32 },
 }
 
 #[derive(Clone, Copy)]
@@ -313,6 +374,8 @@ fn hash_card(h: &mut Hash128, card: &Card) {
     h.mix(types);
     // Broken-ness is carried by the value types; the legacy flag bit is derived state.
     h.mix((card.flags & !model::FLAG_BROKEN) as u64);
+    // Two cards with different ignite counts can behave differently at resolution.
+    h.mix(card.ignited as u64);
     // Effect blocks are interned per state, so the reference identifies the whole list;
     // two cards with equal values but different effects must hash differently.
     h.mix(card.effects_ref as u64);
@@ -325,6 +388,8 @@ struct Solver {
     choices: ChoiceMap,
     nodes: u64,
     aborted: bool,
+    /// Set when a line was scored at the depth or stall cap; surfaced as a note.
+    depth_capped: bool,
     start: Instant,
 }
 
@@ -342,7 +407,7 @@ pub fn solve(root: &State, budget: Budget) -> Outcome {
 /// Takes ownership because the game loop mutates the state while running it (the
 /// managed solver did the same; callers pass clones).
 pub fn evaluate(root: State, budget: Budget) -> f32 {
-    Solver::new(budget).after_player_action(root)
+    Solver::new(budget).after_player_action(root, Ply::ROOT)
 }
 
 impl Solver {
@@ -354,13 +419,14 @@ impl Solver {
             choices: ChoiceMap::default(),
             nodes: 0,
             aborted: false,
+            depth_capped: false,
             start: Instant::now(),
         }
     }
 
     fn best_move(&mut self, root: &State) -> Outcome {
-        let moves = enumerate_moves(root);
-        let legal: Vec<Move> = moves.iter().map(|(mv, _)| *mv).collect();
+        let moves = candidate_moves(root);
+        let legal: Vec<Move> = moves.to_vec();
         let mut values: Vec<Option<f32>> = vec![None; moves.len()];
         let mut best_index: Option<usize> = None;
 
@@ -368,11 +434,14 @@ impl Solver {
         // covered the plausible candidates; ties still resolve to the earliest canonical
         // move, so a complete search reports exactly the move a canonical scan would.
         for index in preference_order(root, &moves) {
-            let (mv, state) = &moves[index];
+            let mv = moves[index];
+            let (child, _) =
+                apply_player_move(root, mv).expect("candidate_moves only lists legal moves");
+            let ply = Ply::ROOT.next(root, &child);
             let value = if mv.kind == MoveKind::SleeveTop {
-                self.best_player(state)
+                self.best_player(&child, ply)
             } else {
-                self.after_player_action(state.clone())
+                self.after_player_action(child, ply)
             };
             if self.aborted {
                 // The value is a horizon estimate, not a finished search; do not trust it.
@@ -402,7 +471,10 @@ impl Solver {
             })
             .collect();
 
-        let mut note = Note::None;
+        let mut note = Note {
+            depth_capped: self.depth_capped,
+            ..Note::default()
+        };
         let partial = self.aborted && best_index.is_some();
         let (mut best, value) = match best_index {
             Some(index) => (
@@ -422,7 +494,7 @@ impl Solver {
             let progress = progress_move(root, &evaluations, value);
             if progress.kind != MoveKind::Pass {
                 best = progress;
-                note = Note::ProgressTieBreak;
+                note.progress_tie_break = true;
             }
         }
 
@@ -458,7 +530,11 @@ impl Solver {
     }
 
     /// Best value for the player when it is the player's turn to choose.
-    fn best_player(&mut self, s: &State) -> f32 {
+    fn best_player(&mut self, s: &State, ply: Ply) -> f32 {
+        if ply.cut() {
+            self.depth_capped = true;
+            return resolve(s);
+        }
         let key = memo_key(b'P', s);
         if let Some(cached) = self.memo.get(&key) {
             return *cached;
@@ -469,11 +545,14 @@ impl Solver {
 
         let mut best = f32::NEG_INFINITY;
         let mut best_move = None;
-        for (mv, child) in enumerate_moves(s) {
+        for mv in candidate_moves(s) {
+            let (child, _) =
+                apply_player_move(s, mv).expect("candidate_moves only lists legal moves");
+            let child_ply = ply.next(s, &child);
             let value = if mv.kind == MoveKind::SleeveTop {
-                self.best_player(&child)
+                self.best_player(&child, child_ply)
             } else {
-                self.after_player_action(child)
+                self.after_player_action(child, child_ply)
             };
             if value > best {
                 best = value;
@@ -495,7 +574,7 @@ impl Solver {
 
     /// Continuation right after the player's turn ended (card played or passed):
     /// the opponent unpass check runs, then the game loop resumes.
-    fn after_player_action(&mut self, mut s: State) -> f32 {
+    fn after_player_action(&mut self, mut s: State, ply: Ply) -> f32 {
         let key = memo_key(b'A', &s);
         if let Some(cached) = self.memo.get(&key) {
             return *cached;
@@ -515,13 +594,13 @@ impl Solver {
             }
         }
 
-        let result = self.run(&mut s);
+        let result = self.run(&mut s, ply);
         self.memo.insert(key, result);
         result
     }
 
     /// Game loop: opponent turns and resolutions until the player has to choose again.
-    fn run(&mut self, s: &mut State) -> f32 {
+    fn run(&mut self, s: &mut State, ply: Ply) -> f32 {
         let key = memo_key(b'R', s);
         if let Some(cached) = self.memo.get(&key) {
             return *cached;
@@ -537,13 +616,16 @@ impl Solver {
                 break;
             }
 
+            let mut advanced = false;
             if !s.o.passed {
+                let before = (s.p.deck_pos, s.o.deck_pos);
                 opponent_act(s);
+                advanced = (s.p.deck_pos, s.o.deck_pos) != before;
                 opponent_unpass_check(s);
             }
 
             if !s.p.passed {
-                result = self.best_player(s);
+                result = self.best_player(s, ply.after_opponent(advanced));
                 break;
             }
 
@@ -580,18 +662,6 @@ impl Solver {
 }
 
 // ---------------------------------------------------------------- rules
-
-/// Every legal root move with the state it leads to, in the order the plugin lists them.
-///
-/// Play semantics live in [`apply_player_move`] only; this is their enumeration.
-fn enumerate_moves(s: &State) -> MoveList {
-    let mut moves = MoveList::new();
-    for mv in candidate_moves(s) {
-        let (child, _) = apply_player_move(s, mv).expect("candidate_moves only lists legal moves");
-        moves.push((mv, child));
-    }
-    moves
-}
 
 /// Legal player moves in the canonical order the plugin reports them.
 fn candidate_moves(s: &State) -> SmallVec<[Move; 16]> {
@@ -705,11 +775,11 @@ fn apply_player_move(s: &State, mv: Move) -> Option<(State, Option<Card>)> {
 /// Search root moves in decreasing order of promise, so a budget abort has already looked
 /// at the heuristic's first choice and the most natural alternatives. The sort is stable,
 /// so everything else keeps the canonical order used for tie-breaking.
-fn preference_order(root: &State, moves: &MoveList) -> Vec<usize> {
+fn preference_order(root: &State, moves: &[Move]) -> Vec<usize> {
     let greedy = greedy_move(root);
     let mut order: Vec<usize> = (0..moves.len()).collect();
     order.sort_by_key(|&index| {
-        let mv = moves[index].0;
+        let mv = moves[index];
         let is_greedy = mv.kind == greedy.kind
             && mv.sleeve_index == greedy.sleeve_index
             && mv.to_opponent == greedy.to_opponent;
@@ -910,16 +980,13 @@ fn resolve_settled(s: &State) -> f32 {
 
 fn resolve_step(s: &State) -> TraceStep {
     match settled_state(s) {
-        Some(resolved) => TraceStep::Resolve {
-            winner: winner(&resolved),
-            p_value: resolved.p_value(),
-            o_value: resolved.o_value(),
-        },
-        None => TraceStep::Resolve {
-            winner: winner(s),
-            p_value: s.p_value(),
-            o_value: s.o_value(),
-        },
+        Some(resolved) => TraceStep::after(
+            TraceAction::Resolve {
+                winner: winner(&resolved),
+            },
+            &resolved,
+        ),
+        None => TraceStep::after(TraceAction::Resolve { winner: winner(s) }, s),
     }
 }
 
@@ -944,8 +1011,8 @@ fn build_trace(root: &State, root_move: Move, choices: &ChoiceMap) -> Vec<TraceS
             Some(applied) => applied,
             None => break,
         };
-        steps.push(TraceStep::Player { mv, card });
         s = child;
+        steps.push(TraceStep::after(TraceAction::Player { mv, card }, &s));
 
         if mv.kind == MoveKind::SleeveTop {
             continue; // sleeving does not end the turn
@@ -970,8 +1037,12 @@ fn build_trace(root: &State, root_move: Move, choices: &ChoiceMap) -> Vec<TraceS
             }
             if !s.o.passed {
                 match opponent_act(&mut s) {
-                    OpponentAction::Draw(card) => steps.push(TraceStep::OpponentDraw { card }),
-                    OpponentAction::Pass => steps.push(TraceStep::OpponentPass),
+                    OpponentAction::Draw(card) => {
+                        steps.push(TraceStep::after(TraceAction::OpponentDraw { card }, &s))
+                    }
+                    OpponentAction::Pass => {
+                        steps.push(TraceStep::after(TraceAction::OpponentPass, &s))
+                    }
                 }
                 opponent_unpass_check(&mut s);
             }
@@ -1037,38 +1108,23 @@ fn greedy_move(s: &State) -> Move {
 }
 
 /// Deck-progress nudge: among the moves that tie the best (non-positive) value, prefer
-/// playing a dead card over passing, so the deck keeps moving.
+/// playing a dead top card over passing, so the deck keeps moving. Sleeve plays are
+/// deliberately excluded: they consume no deck position, so preferring them can turn a
+/// card that returns to the sleeve into an endless play loop.
 fn progress_move(root: &State, evaluations: &[Eval], best: f32) -> Move {
     const EPS: f32 = 0.0001;
-    let mut sleeve = None;
-    let mut has_sleeve = false;
 
     for eval in evaluations {
         if eval.value < best - EPS {
             continue;
         }
-        match eval.mv.kind {
-            MoveKind::PlayTop => {
-                if let Some(top) = root.p.top()
-                    && top.is_dead()
-                {
-                    return eval.mv;
-                }
-            }
-            MoveKind::PlaySleeve => {
-                let index = eval.mv.sleeve_index;
-                if !has_sleeve
-                    && index >= 0
-                    && let Some(card) = root.p.sleeve.get(index as usize)
-                    && card.is_dead()
-                {
-                    sleeve = Some(eval.mv);
-                    has_sleeve = true;
-                }
-            }
-            _ => {}
+        if eval.mv.kind == MoveKind::PlayTop
+            && let Some(top) = root.p.top()
+            && top.is_dead()
+        {
+            return eval.mv;
         }
     }
 
-    sleeve.unwrap_or_else(Move::pass)
+    Move::pass()
 }

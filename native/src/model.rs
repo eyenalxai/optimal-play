@@ -93,6 +93,8 @@ pub struct Card {
     pub values: [i32; MAX_VALUES],
     pub value_count: u8,
     pub flags: u8,
+    /// IgniteModifier count; a second ignite burns (exhausts) the card.
+    pub ignited: u8,
     /// `ModifiableValue.EType` bits per value.
     pub types: [u8; MAX_VALUES],
     /// Index+1 into [`State::effect_blocks`]; 0 means the card has no effects.
@@ -112,6 +114,7 @@ impl Card {
             values: padded,
             value_count: values.len() as u8,
             flags,
+            ignited: 0,
             types,
             effects_ref: 0,
         }
@@ -287,6 +290,8 @@ pub struct State {
     pub o_mods: i32,
     pub holds_at: i32,
     pub insight_left: i32,
+    /// The round's Blind value, compared against by `Blind` activation conditions.
+    pub blind: i32,
     pub sleeve_size: i32,
     /// Shared with every cloned state: the cost table is immutable for a whole search.
     pub sleeve_costs: Arc<[i32]>,
@@ -316,6 +321,7 @@ impl State {
             o_mods: 0,
             holds_at: 0,
             insight_left: 0,
+            blind: 0,
             sleeve_size: 0,
             sleeve_costs: Arc::from([]),
             effect_blocks: Arc::from([]),

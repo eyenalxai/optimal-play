@@ -30,9 +30,21 @@ namespace BlackJacket.OptimalPlay
         public int Kind;
         public SolverMove Move;
         public TraceCard Card;
+
+        /// <summary>Only set on resolve steps: -1 loss, 0 tie, 1 win.</summary>
+        public int Winner;
+
+        /// <summary>Table values after the step.</summary>
         public int PValue;
         public int OValue;
-        public int Winner;
+
+        /// <summary>Bets after the step; effects can move coins into them.</summary>
+        public int PBet;
+        public int OBet;
+
+        /// <summary>Stashes after the step.</summary>
+        public int PStash;
+        public int OStash;
     }
 
     /// <summary>Everything one native solve call reports back.</summary>
@@ -47,6 +59,9 @@ namespace BlackJacket.OptimalPlay
         public bool Partial;
 
         public bool ProgressTieBreak;
+
+        /// <summary>True when an effect loop forced the search to score a line at its depth cap.</summary>
+        public bool DepthCapped;
 
         public int PValue;
         public int OValue;
@@ -76,6 +91,7 @@ namespace BlackJacket.OptimalPlay
     internal static class SolverReport
     {
         internal const string ProgressNote = "progress tie-break: played a dead card instead of passing";
+        internal const string DepthNote = "search cap: an endless effect loop was cut off at a horizon";
 
         internal static string MoveLabel(SolverMove move, SolverState s)
         {
@@ -185,6 +201,8 @@ namespace BlackJacket.OptimalPlay
         internal static string DescribeTrace(SolveResult result)
         {
             var sb = new StringBuilder();
+            int pValue = 0, oValue = 0, pBet = 0, oBet = 0, pStash = 0, oStash = 0;
+            bool first = true;
             foreach (SolveTraceStep step in result.Trace)
             {
                 switch (step.Kind)
@@ -228,7 +246,35 @@ namespace BlackJacket.OptimalPlay
                             .Append(" (").Append(step.PValue).Append(" vs ").Append(step.OValue).Append(")");
                         break;
                 }
+
+                // Effect-driven changes would be invisible otherwise: coins can move into a
+                // bet and table values can change at resolution without a player move.
+                var parts = new List<string>();
+                if (step.Kind != 3 && (first || step.PValue != pValue || step.OValue != oValue))
+                {
+                    parts.Add($"P {step.PValue} vs O {step.OValue}");
+                }
+                if (first || step.PBet != pBet || step.OBet != oBet)
+                {
+                    parts.Add($"bet {step.PBet}/{step.OBet}");
+                }
+                if (!first && (step.PStash != pStash || step.OStash != oStash))
+                {
+                    parts.Add($"coins {step.PStash}/{step.OStash}");
+                }
+                if (parts.Count > 0)
+                {
+                    sb.Append(" (").Append(string.Join(", ", parts)).Append(')');
+                }
                 sb.AppendLine();
+
+                pValue = step.PValue;
+                oValue = step.OValue;
+                pBet = step.PBet;
+                oBet = step.OBet;
+                pStash = step.PStash;
+                oStash = step.OStash;
+                first = false;
             }
             return sb.ToString();
         }

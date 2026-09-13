@@ -105,15 +105,17 @@ namespace BlackJacket.OptimalPlay
                 Value = (float)reader.F64(),
                 Nodes = (int)reader.U64(),
                 Aborted = reader.U32() != 0,
-                ProgressTieBreak = reader.U32() != 0,
-                Partial = reader.U32() != 0,
-                PValue = reader.I32(),
-                OValue = reader.I32(),
-                PTarget = reader.I32(),
-                OTarget = reader.I32(),
-                Payable = reader.I32(),
-                SleeveCost = reader.I32(),
             };
+            uint note = reader.U32();
+            result.ProgressTieBreak = (note & 1) != 0;
+            result.DepthCapped = (note & 2) != 0;
+            result.Partial = reader.U32() != 0;
+            result.PValue = reader.I32();
+            result.OValue = reader.I32();
+            result.PTarget = reader.I32();
+            result.OTarget = reader.I32();
+            result.Payable = reader.I32();
+            result.SleeveCost = reader.I32();
 
             uint flags = reader.U32();
             result.CanPass = (flags & 1) != 0;
@@ -149,14 +151,21 @@ namespace BlackJacket.OptimalPlay
             result.Trace = new List<SolveTraceStep>(traceCount);
             for (int i = 0; i < traceCount; i++)
             {
+                int kind = (int)reader.U32();
+                SolverMove move = reader.Move();
+                TraceCard card = reader.Card();
                 result.Trace.Add(new SolveTraceStep
                 {
-                    Kind = (int)reader.U32(),
-                    Move = reader.Move(),
-                    Card = reader.Card(),
+                    Kind = kind,
+                    Move = move,
+                    Card = card,
+                    Winner = reader.I32(),
                     PValue = reader.I32(),
                     OValue = reader.I32(),
-                    Winner = reader.I32(),
+                    PBet = reader.I32(),
+                    OBet = reader.I32(),
+                    PStash = reader.I32(),
+                    OStash = reader.I32(),
                 });
             }
             return result;

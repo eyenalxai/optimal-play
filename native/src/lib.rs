@@ -30,6 +30,27 @@ const ERR_PANIC: i32 = -100;
 const STATUS_TOO_SMALL: i32 = 1;
 const MAX_BATCH_CANDIDATES: usize = 4096;
 
+/// Stack every search runs on. The game runs the solver on a Mono worker thread whose
+/// stack can be as small as 1 MiB; card effects can stretch a line to hundreds of plies,
+/// so the native side gives its own threads a generous fixed stack instead.
+pub(crate) const SOLVER_STACK: usize = 64 * 1024 * 1024;
+
+/// Run a search on a dedicated big-stack thread and propagate its result (or panic).
+fn solver_thread<T: Send>(run: impl FnOnce() -> T + Send) -> Result<T, i32> {
+    let joined = std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .name("opl-solver".to_owned())
+            .stack_size(SOLVER_STACK)
+            .spawn_scoped(scope, run)
+            .map_err(|_| ERR_PANIC)?;
+        Ok::<_, i32>(handle.join())
+    })?;
+    match joined {
+        Ok(value) => Ok(value),
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn opl_version() -> u32 {
     VERSION
@@ -47,7 +68,7 @@ pub extern "C" fn opl_solve(
 ) -> i32 {
     dispatch(input, input_len, output, output_cap, out_len, |reader| {
         let state = parse_state(reader)?;
-        let outcome = solver::solve(&state, budget(node_budget, time_ms));
+        let outcome = solver_thread(move || solver::solve(&state, budget(node_budget, time_ms)))?;
         let mut writer = Writer::new();
         write_solve_result(&mut writer, &outcome);
         Ok(writer.into_vec())
@@ -66,7 +87,7 @@ pub extern "C" fn opl_evaluate(
 ) -> i32 {
     dispatch(input, input_len, output, output_cap, out_len, |reader| {
         let state = parse_state(reader)?;
-        let value = solver::evaluate(state, budget(node_budget, time_ms));
+        let value = solver_thread(move || solver::evaluate(state, budget(node_budget, time_ms)))?;
         let mut writer = Writer::new();
         write_evaluate_result(&mut writer, value);
         Ok(writer.into_vec())
@@ -93,7 +114,9 @@ pub extern "C" fn opl_evaluate_batch(
         for _ in 0..count {
             candidates.push(parse_candidate(reader)?);
         }
-        let values = batch::evaluate_candidates(&base, &candidates, budget(node_budget, time_ms))?;
+        let values = solver_thread(move || {
+            batch::evaluate_candidates(&base, &candidates, budget(node_budget, time_ms))
+        })??;
         let mut writer = Writer::new();
         write_batch_result(&mut writer, &values);
         Ok(writer.into_vec())

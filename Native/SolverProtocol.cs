@@ -12,7 +12,7 @@ namespace BlackJacket.OptimalPlay
     /// </summary>
     internal static class SolverProtocol
     {
-        internal const uint Version = 2;
+        internal const uint Version = 3;
 
         internal const uint FlagUprising = 1;
         internal const uint FlagSupper = 2;
@@ -63,6 +63,7 @@ namespace BlackJacket.OptimalPlay
             w.I32(state.Payable);
             w.I32(state.Pot);
             w.U32(state.PotUsable ? 1u : 0u);
+            w.I32(state.Blind);
 
             int[] costs = state.SleeveCosts ?? Array.Empty<int>();
             w.U32(costs.Length);
@@ -134,6 +135,7 @@ namespace BlackJacket.OptimalPlay
                 flags |= CardBroken;
             }
             w.U32(flags);
+            w.U32(card.Ignited);
 
             List<SolverEffect> effects = card.Effects ?? EmptyEffects;
             w.U32(effects.Count);

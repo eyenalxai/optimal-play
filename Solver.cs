@@ -58,6 +58,10 @@ namespace BlackJacket.OptimalPlay
         public bool AlwaysInsight;
         public bool CanPlayOpponent;
         public bool Broken;
+
+        /// <summary>IgniteModifier count; a second ignite burns the card.</summary>
+        public int Ignited;
+
         public string Name;
         public string Effect;
 
@@ -117,6 +121,7 @@ namespace BlackJacket.OptimalPlay
                 AlwaysInsight = gc.OpponentAlwaysHasInsightOnThisCard,
                 CanPlayOpponent = gc.CanBePlayedInOpponentsSlots,
                 Broken = HasBroken(types),
+                Ignited = gc.CardModifiers.Count(modifier => modifier is IgniteModifier),
                 Name = name,
                 Effect = string.IsNullOrEmpty(gc.EffectText) ? null : gc.EffectText.Replace("\n", " "),
                 Effects = effects,
@@ -176,6 +181,9 @@ namespace BlackJacket.OptimalPlay
         public int[] SleeveCosts;
         public int Payable;
         public int Pot;
+
+        /// <summary>The round's Blind value; compared against by the game's Blind condition.</summary>
+        public int Blind;
 
         /// <summary>True when sleeve costs may also draw on the winners pot.</summary>
         public bool PotUsable;

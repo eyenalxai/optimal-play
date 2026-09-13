@@ -9,16 +9,17 @@
 //! u32 version; u32 flags (1 uprising, 2 supper)
 //! i32 plain_target, p_mods, o_mods, holds_at, insight_left, sleeve_size, payable, pot
 //! u32 pot_usable (1 when sleeve costs may also draw on the winners pot)
+//! i32 blind (the round's Blind value, for Blind activation conditions)
 //! u32 cost_count; i32[cost_count] sleeve_costs
 //! side P, side O
 //! ```
 //! Side: `i32 deck_pos, capacity, bet, stash; u32 sleeve_draws, passed, out_of_cards,
 //! discard_count;` then the deck, sleeve and table zones. A zone is `u32 len` followed
 //! by cards. A card is `u32 value_count;` then per value `i32 value, u32 types`
-//! (`ModifiableValue.EType` bits), `u32 flags; u32 effect_count;` then the effect
-//! records. An effect is `u32 trigger, u32 flags, u32 op, u32 target, i32 t1, i32 t2,
-//! i32 t3, i32 a, i32 b, i32 c, i32 d, u32 filter, u32 cond, u32 cond_cmp, i32 cond_a,
-//! i32 cond_b`.
+//! (`ModifiableValue.EType` bits), `u32 flags; u32 ignited; u32 effect_count;` then the
+//! effect records. An effect is `u32 trigger, u32 flags, u32 op, u32 target, i32 t1,
+//! i32 t2, i32 t3, i32 a, i32 b, i32 c, i32 d, u32 filter, u32 cond, u32 cond_cmp,
+//! i32 cond_a, i32 cond_b`.
 //!
 //! Batch input appends `u32 candidate_count` and per candidate a length-framed op block:
 //! `u32 byte_len` followed by ops: `u32 kind; u32 side; i32 a; i32 b; u32 list_len;
@@ -27,9 +28,9 @@
 //! (`a` = table index).
 
 use crate::model::{Card, Effect, EffectBlock, MAX_EFFECTS, MAX_VALUES, Side, State};
-use crate::solver::{MoveKind, Note, Outcome, SleeveReason, TraceStep};
+use crate::solver::{MoveKind, Note, Outcome, SleeveReason, TraceAction};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 pub const ERR_VERSION: i32 = -1;
 pub const ERR_TRUNCATED: i32 = -2;
@@ -106,6 +107,7 @@ pub fn parse_state(r: &mut Reader) -> Result<State, i32> {
     let payable = r.i32()?;
     let pot = r.i32()?;
     let pot_usable = r.u32()? != 0;
+    let blind = r.i32()?;
 
     let cost_count = r.u32()? as usize;
     if cost_count > MAX_ZONE {
@@ -130,6 +132,7 @@ pub fn parse_state(r: &mut Reader) -> Result<State, i32> {
     state.payable = payable;
     state.pot = pot;
     state.pot_usable = pot_usable;
+    state.blind = blind;
     state.sleeve_costs = sleeve_costs.into();
     state.effect_blocks = interner.blocks.into();
     state.uprising = flags & 1 != 0;
@@ -214,6 +217,12 @@ fn parse_card(r: &mut Reader, interner: &mut EffectInterner) -> Result<Card, i32
         return Err(ERR_CARD);
     }
     card.flags = flags as u8;
+
+    let ignited = r.u32()?;
+    if ignited > 2 {
+        return Err(ERR_CARD);
+    }
+    card.ignited = ignited as u8;
 
     let effect_count = r.u32()? as usize;
     if effect_count > MAX_EFFECTS {
@@ -487,52 +496,48 @@ pub fn write_solve_result(out: &mut Writer, outcome: &Outcome) {
 
     out.u32(outcome.trace.len() as u32);
     for step in &outcome.trace {
-        match step {
-            TraceStep::Player { mv, card } => {
+        match step.action {
+            TraceAction::Player { mv, card } => {
                 out.u32(0);
                 out.i32(move_kind_code(mv.kind));
                 out.i32(mv.sleeve_index);
                 out.u32(mv.to_opponent as u32);
-                write_trace_card(out, *card);
-                out.i32(0);
-                out.i32(0);
+                write_trace_card(out, card);
                 out.i32(0);
             }
-            TraceStep::OpponentDraw { card } => {
+            TraceAction::OpponentDraw { card } => {
                 out.u32(1);
                 out.i32(0);
                 out.i32(0);
                 out.u32(0);
-                write_trace_card(out, Some(*card));
-                out.i32(0);
-                out.i32(0);
+                write_trace_card(out, Some(card));
                 out.i32(0);
             }
-            TraceStep::OpponentPass => {
+            TraceAction::OpponentPass => {
                 out.u32(2);
                 out.i32(0);
                 out.i32(0);
                 out.u32(0);
                 write_trace_card(out, None);
                 out.i32(0);
-                out.i32(0);
-                out.i32(0);
             }
-            TraceStep::Resolve {
-                winner,
-                p_value,
-                o_value,
-            } => {
+            TraceAction::Resolve { winner } => {
                 out.u32(3);
                 out.i32(0);
                 out.i32(0);
                 out.u32(0);
                 write_trace_card(out, None);
-                out.i32(*p_value);
-                out.i32(*o_value);
-                out.i32(*winner);
+                out.i32(winner);
             }
         }
+        // The position right after the action: effect-driven coin and value changes show
+        // up here even when no player move caused them.
+        out.i32(step.p_value);
+        out.i32(step.o_value);
+        out.i32(step.p_bet);
+        out.i32(step.o_bet);
+        out.i32(step.p_stash);
+        out.i32(step.o_stash);
     }
 }
 
@@ -576,10 +581,8 @@ fn move_kind_code(kind: MoveKind) -> i32 {
 }
 
 fn note_code(note: Note) -> u32 {
-    match note {
-        Note::None => 0,
-        Note::ProgressTieBreak => 1,
-    }
+    // Bit 0 progress tie-break, bit 1 depth/stall cap; the plugin renders each bit.
+    u32::from(note.progress_tie_break) | (u32::from(note.depth_capped) << 1)
 }
 
 fn sleeve_reason_code(reason: SleeveReason) -> u32 {

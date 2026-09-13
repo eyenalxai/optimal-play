@@ -63,6 +63,8 @@ namespace BlackJacket.OptimalPlay
         internal const byte OpSkipTurn = 15;
         internal const byte OpTrigger = 16;
         internal const byte OpSwap = 17;
+        internal const byte OpInsight = 18;
+        internal const byte OpIgnite = 19;
 
         // Target kinds.
         internal const byte TargetNone = 0;
@@ -85,6 +87,7 @@ namespace BlackJacket.OptimalPlay
         internal const byte CondHasBlackjack = 1;
         internal const byte CondCoins = 2;
         internal const byte CondCanRaise = 3;
+        internal const byte CondBlind = 4;
 
         // CardLocationConfig destinations used by MoveCard/DrawCards.
         internal const int MoveTopOfDeck = 1;
@@ -143,7 +146,7 @@ namespace BlackJacket.OptimalPlay
 
                 if (!TryConditions(container.ActivationConditions, out byte cond, out byte condCmp, out int condA, out int condB))
                 {
-                    unmodeled.Add($"trigger {(int)container.Trigger}: unsupported activation conditions");
+                    unmodeled.Add($"{card.name}: unsupported conditions {ConditionNames(container.ActivationConditions)}");
                     continue;
                 }
 
@@ -157,7 +160,7 @@ namespace BlackJacket.OptimalPlay
                     List<SolverEffect> specs = MapEffect(effect);
                     if (specs == null)
                     {
-                        unmodeled.Add(effect == null ? "empty effect" : effect.GetType().Name);
+                        unmodeled.Add($"{card.name}: {effect?.GetType().Name ?? "empty effect"}");
                         continue;
                     }
                     Assign(specs, trigger, flags, cond, condCmp, condA, condB, mapped);
@@ -222,9 +225,29 @@ namespace BlackJacket.OptimalPlay
                     a = coins.CoinAmount;
                     b = coins.CoinAmount2;
                     return true;
+                case Blind blind:
+                    cond = CondBlind;
+                    cmp = (byte)blind.ComparisonMode;
+                    a = blind.Value;
+                    return true;
                 default:
                     return false;
             }
+        }
+
+        /// <summary>Names of a container's activation conditions, for the log.</summary>
+        private static string ConditionNames(ActivationConditions conditions)
+        {
+            if (conditions == null || conditions.Conditions == null || conditions.Conditions.Length == 0)
+            {
+                return "none";
+            }
+            var names = new List<string>(conditions.Conditions.Length);
+            foreach (ActivationCondition condition in conditions.Conditions)
+            {
+                names.Add(condition == null ? "null" : condition.GetType().Name);
+            }
+            return string.Join("+", names);
         }
 
         /// <summary>True when a coin collector contributes nothing at execution time.</summary>
@@ -453,12 +476,10 @@ namespace BlackJacket.OptimalPlay
                 }
                 case Discard discard:
                 {
-                    // Discarding a draw pile also shuffles the discard into it, which the
-                    // native search cannot model (the result depends on a random order).
-                    if (HasGatherLocation(discard.CardTargetConfig, (int)ELocation.DrawPile))
-                    {
-                        return null;
-                    }
+                    // Discarding cards from a draw pile also shuffles the discard back in
+                    // when the pile empties. The search cannot model the random reshuffle,
+                    // but removing the discarded cards from the pile is the right short-term
+                    // behavior and the search stops at draw-pile exhaustion anyway.
                     TargetSpec spec;
                     if (!TryTargets((int)discard.RelativeCardPosition, discard.CardTargetConfig, null, out spec))
                     {
@@ -632,6 +653,55 @@ namespace BlackJacket.OptimalPlay
                         WithTarget(OpExhaust, new TargetSpec { Relative = RelSelf }),
                     };
                 }
+                case Ignite ignite:
+                {
+                    TargetSpec spec;
+                    if (!TryTargets(EnumInt(ignite, "RelativeTarget"), null,
+                            Field<CardTargetConfiguration>(ignite, "_targetConfiguration"), out spec))
+                    {
+                        return null;
+                    }
+                    return One(WithTarget(OpIgnite, spec));
+                }
+                case Insight insight:
+                {
+                    // Forcing the ace out or aiming at the opponent's deck changes which cards
+                    // get reordered; the simple case only grants the executor insight.
+                    if (insight.ForceDiscardAce || insight.InsightOnOpposer
+                        || !IsEmptyAmountCollector(insight.AmountCollector))
+                    {
+                        return null;
+                    }
+                    return One(new SolverEffect
+                    {
+                        Op = OpInsight,
+                        Target = TargetNone,
+                        A = insight.InsightAmount,
+                    });
+                }
+                case RaiseEffect raise:
+                {
+                    if (!IsEmptyAmountCollector(raise.amountCollector))
+                    {
+                        return null;
+                    }
+                    // Greed turns the raise into a forced raise paid from the other side.
+                    bool greed = GameController.Instance != null
+                        && GameController.Instance.CurrentMatch != null
+                        && GameController.Instance.CurrentMatch.GameRules.Contains(GameRule.Greed);
+                    int owner = (int)(greed ? CoinZoneHelper.EOwner.Other : CoinZoneHelper.EOwner.Self);
+                    return One(new SolverEffect
+                    {
+                        Op = OpCoins,
+                        Target = TargetNone,
+                        A = owner | ((int)CoinZoneHelper.EZone.Stash << 8),
+                        B = owner | ((int)CoinZoneHelper.EZone.Bet << 8),
+                        C = raise.Amount,
+                    });
+                }
+                case FamilyTrioGraphVersion:
+                    // Only raises the FamilyTrio UI event; no card, coin or value changes.
+                    return One(new SolverEffect { Op = OpNone, Target = TargetNone });
                 case MarkCard:
                     // Purely cosmetic (card back / mark VFX).
                     return One(new SolverEffect { Op = OpNone, Target = TargetNone });
@@ -661,22 +731,6 @@ namespace BlackJacket.OptimalPlay
             }
         }
 
-        private static bool HasGatherLocation(UniversalCardTargetConfig universal, int location)
-        {
-            if (universal == null || universal.GatherCardsSteps == null)
-            {
-                return false;
-            }
-            foreach (GatherCardsStep step in universal.GatherCardsSteps)
-            {
-                if (step is GatherCardsByLocation byLocation && ((int)byLocation.Location & location) != 0)
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-
         private static bool SingleZone(int zone)
         {
             return (zone & (zone - 1)) == 0;
@@ -698,6 +752,13 @@ namespace BlackJacket.OptimalPlay
                 if (field != null)
                 {
                     object raw = field.GetValue(target);
+                    return raw == null ? 0 : Convert.ToInt32(raw, CultureInfo.InvariantCulture);
+                }
+                // Some effects expose their settings as auto-properties.
+                PropertyInfo property = type.GetProperty(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (property != null && property.CanRead)
+                {
+                    object raw = property.GetValue(target);
                     return raw == null ? 0 : Convert.ToInt32(raw, CultureInfo.InvariantCulture);
                 }
             }

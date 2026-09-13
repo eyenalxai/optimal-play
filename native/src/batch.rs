@@ -5,11 +5,27 @@
 //! for rayon. The main draw-phase search stays single-threaded: it is one memoized DFS
 //! where sharing the transposition table matters more than splitting the root.
 
+use std::sync::OnceLock;
+
 use rayon::prelude::*;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use crate::model::State;
 use crate::protocol::{Op, apply_ops};
 use crate::solver::{Budget, evaluate};
+
+/// One long-lived pool so candidate searches run on threads with the same generous
+/// stack as the main solve instead of rayon's default.
+fn pool() -> &'static ThreadPool {
+    static POOL: OnceLock<ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        ThreadPoolBuilder::new()
+            .thread_name(|index| format!("opl-batch-{index}"))
+            .stack_size(crate::SOLVER_STACK)
+            .build()
+            .expect("rayon pool")
+    })
+}
 
 pub fn evaluate_candidates(
     base: &State,
@@ -27,8 +43,10 @@ pub fn evaluate_candidates(
         })
         .collect::<Result<_, i32>>()?;
 
-    Ok(states
-        .into_par_iter()
-        .map(|state| evaluate(state, budget))
-        .collect())
+    Ok(pool().install(|| {
+        states
+            .into_par_iter()
+            .map(|state| evaluate(state, budget))
+            .collect()
+    }))
 }

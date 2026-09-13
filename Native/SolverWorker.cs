@@ -63,7 +63,9 @@ namespace BlackJacket.OptimalPlay
                     return;
                 }
 
-                _thread = new Thread(Loop)
+                // The native side runs each search on its own big-stack threads, so this
+                // one only marshals; the generous stack is belt and braces.
+                _thread = new Thread(Loop, 16 * 1024 * 1024)
                 {
                     IsBackground = true,
                     Name = "OptimalPlaySolver",

@@ -98,11 +98,16 @@ log adds the expected line of play:
 
 ```
 Expected line:
-  you play top [5] to opponent
-  opponent draws [10]
+  you play top [5] to opponent (P 5 vs O 10, bet 2/3)
+  opponent draws [10] (P 5 vs O 20)
   opponent passes
-  resolve: loss (18 vs 24)
+  resolve: loss (5 vs 20) (bet 2/3)
 ```
+
+The parentheses after a step show the table totals and the coins at stake after that
+step, but only when they changed, so effect-driven coin moves and value changes are
+visible without a player move. A `[search cap: ...]` note means the line ran into an
+endless effect loop and was cut off at a horizon (see `docs/effects.md`).
 
 Selection dialogs log one line each, e.g.:
 
@@ -143,8 +148,10 @@ Two rules keep those cards from stalling the bot:
 
 - **Progress tie-break.** Losing a round costs your bet no matter how you lose it. When every
   move (including passing) is worth the same non-positive amount and the top card is a dead
-  card (best value <= 0), the bot plays/sleeves it instead of passing. Passing forever would
-  leave that card stuck on top of the draw pile and never reach the rest of the deck.
+  card (best value <= 0), the bot plays it instead of passing. Passing forever would leave
+  that card stuck on top of the draw pile and never reach the rest of the deck. Dead *sleeve*
+  cards are not preferred: a sleeve play consumes no deck position, so a card that returns to
+  the sleeve would otherwise be played forever.
 - **Playing to the opponent's table.** Cards with *"Play into any slot."* (the game's
   `CanBePlayedInOpponentsSlots`) can be dropped on the opponent's side; the solver considers
   both sides and uses whichever is better. The search models the value change on either
@@ -180,8 +187,13 @@ leaves all input manual.
   shuffle and re-plans with the real order on the next turn.
 - Card effects are modeled as far as `docs/effects.md` describes. Effects outside that
   list (shuffles, transforms, random choices, discard-pile picks, duo/trio events, ...)
-  are skipped and each distinct one is logged once as `Unmodeled card effect: <name>`.
-  The affected card is then scored as if the missing effect did nothing.
+  are skipped and each distinct card/effect pair is logged once as
+  `Unmodeled card effect: <card>: <effect>`. The affected card is then scored as if the
+  missing effect did nothing.
+- Card effects can recycle cards endlessly (a hollow card that returns to the sleeve, for
+  example). The search cuts such lines off at a depth/no-progress cap and books them at the
+  current round result instead of hanging or crashing; the decision log marks it with a
+  "search cap" note.
 - Sleeving a card does not model triggers such as *"When you sleeve a card ..."* perks; the
   sleeve contents, their order and the sleeve costs are modeled exactly.
 - Insight windows with more than four revealed cards only permute the top four; the rest

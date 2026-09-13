@@ -292,6 +292,10 @@ namespace BlackJacket.OptimalPlay
                 {
                     sb.Append(" [").Append(SolverReport.ProgressNote).Append(']');
                 }
+                if (result.DepthCapped)
+                {
+                    sb.Append(" [").Append(SolverReport.DepthNote).Append(']');
+                }
                 var ranked = new List<MoveEvaluation>(result.Evaluations);
                 ranked.Sort((a, b) => b.Value.CompareTo(a.Value));
                 sb.Append(" | options: ");
@@ -398,6 +402,7 @@ namespace BlackJacket.OptimalPlay
             sb.Append("=== Optimal Play: ").Append(source).AppendLine(" ===");
             sb.Append("match: target ").Append(sim.PlainTarget)
                 .Append(", holds at ").Append(sim.HoldsAt)
+                .Append(", blind ").Append(sim.Blind)
                 .Append(", rules: ").Append(Rules(sim)).AppendLine();
             AppendSide(sb, "player", sim, sim.P, result.PValue, result.PTarget);
             AppendSide(sb, "opponent", sim, sim.O, result.OValue, result.OTarget);
@@ -424,6 +429,10 @@ namespace BlackJacket.OptimalPlay
             if (result.ProgressTieBreak)
             {
                 sb.Append(" [").Append(SolverReport.ProgressNote).Append(']');
+            }
+            if (result.DepthCapped)
+            {
+                sb.Append(" [").Append(SolverReport.DepthNote).Append(']');
             }
             sb.AppendLine();
             if (result.Trace.Count > 0)
@@ -499,6 +508,10 @@ namespace BlackJacket.OptimalPlay
             {
                 SolverCard card = cards[i];
                 string part = card.Label;
+                if (card.Ignited > 0)
+                {
+                    part += " [ignited]";
+                }
                 if (card.Effects.Count > 0)
                 {
                     part += " ~" + card.Effects.Count;
@@ -531,6 +544,7 @@ namespace BlackJacket.OptimalPlay
                 OMods = os.TableValueModifiers.Sum(),
                 HoldsAt = gc.CurrentMatch != null ? gc.CurrentMatch.OpponentHoldsAtXTableValue : 17,
                 InsightLeft = OpponentController.Instance != null ? OpponentController.Instance.DeckInsight : 0,
+                Blind = gc.State.Blind,
                 SleeveSize = GameController.Config.SleeveSize.ModifiedValue,
                 SleeveCosts = (int[])GameController.Config.DrawToSleeveCosts.ModifiedValue.Clone(),
                 Uprising = gc.CurrentMatch != null && gc.CurrentMatch.HasRule(GameRule.Uprising),

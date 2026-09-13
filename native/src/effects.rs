@@ -29,6 +29,8 @@ pub const OP_COINS: u8 = 14;
 pub const OP_SKIP_TURN: u8 = 15;
 pub const OP_TRIGGER: u8 = 16;
 pub const OP_SWAP: u8 = 17;
+pub const OP_INSIGHT: u8 = 18;
+pub const OP_IGNITE: u8 = 19;
 
 // Target kinds (`Effect.target`).
 pub const TARGET_NONE: u8 = 0;
@@ -429,15 +431,18 @@ pub const COND_NONE: u8 = 0;
 pub const COND_HAS_BLACKJACK: u8 = 1;
 pub const COND_COINS: u8 = 2;
 pub const COND_CAN_RAISE: u8 = 3;
+pub const COND_BLIND: u8 = 4;
 
 fn compare(mode: u8, left: i32, right: i32) -> bool {
+    // Mirrors `ValueComparison.Compare`; every condition enum value maps in range.
     match mode {
         0 => left == right,
         1 => left != right,
         2 => left < right,
         3 => left <= right,
         4 => left > right,
-        _ => left >= right,
+        5 => left >= right,
+        _ => false,
     }
 }
 
@@ -457,6 +462,7 @@ pub fn condition_ok(state: &State, effect: &Effect, executor: usize) -> bool {
             compare(effect.cond_cmp, effect.cond_a, effect.cond_b)
         }
         COND_CAN_RAISE => side_ref(state, executor).stash >= effect.cond_a,
+        COND_BLIND => compare(effect.cond_cmp, effect.cond_a, state.blind),
         _ => true,
     }
 }
@@ -794,6 +800,37 @@ pub fn apply_effect(state: &mut State, source: Spot, effect: &Effect, depth: u8)
             }
             if let Some(card) = side_mut(state, target.side).table.get_mut(target.index) {
                 *card = a;
+            }
+            state.invalidate_values();
+        }
+        OP_INSIGHT => {
+            // The opponent peeks at the top of its own deck; the player already sees every
+            // card and reorders the pile through the plugin, so only side 1 is affected.
+            if source.side == 1 {
+                state.insight_left = state.insight_left.saturating_add(effect.a.max(0));
+            }
+        }
+        OP_IGNITE => {
+            // `Ignite` adds an IgniteModifier; the second one burns the card, exactly like
+            // `ExhaustGroupEffect` does in `IgniteModifier.Apply`.
+            let spots = gather_targets(state, source, effect);
+            for &spot in spots.iter().rev() {
+                if spot.zone != ZONE_TABLE {
+                    continue;
+                }
+                let burned = {
+                    let side = side_mut(state, spot.side);
+                    match side.table.get_mut(spot.index) {
+                        Some(card) => {
+                            card.ignited = card.ignited.saturating_add(1).min(2);
+                            card.ignited >= 2
+                        }
+                        None => false,
+                    }
+                };
+                if burned {
+                    take_card(state, spot);
+                }
             }
             state.invalidate_values();
         }

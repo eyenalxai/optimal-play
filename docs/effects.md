@@ -21,8 +21,9 @@ search activates the player's optional containers (the prompt is answered by
 `AutoActivateOptionalEffects`) and the opponent's, except when the opponent has a
 blackjack and the card sets `DontActivateIfOpponentHasBlackjack`.
 
-Activation conditions are evaluated for `HasBlackJack`, `CanRaise` and constant-only
-`Coins`; any other condition marks the whole container unmodeled.
+Activation conditions are evaluated for `HasBlackJack`, `CanRaise`, constant-only
+`Coins` and `Blind`; any other condition (e.g. `CardAdjacency`, which needs card
+identity) marks the whole container unmodeled.
 
 ### Ops
 
@@ -38,11 +39,13 @@ Activation conditions are evaluated for `HasBlackJack`, `CanRaise` and constant-
 | Draw | `DrawCards` | draw pile to table (capacity-gated), sleeve, discard or deck |
 | Duplicate | `Duplicate` | ToTable and ToSleeve copies; ToDeck's random insert is unmodeled |
 | Exploit | `Exploit` | opponent stash to opponent bet, value-limited |
-| Coins | `CoinsEffect` | create/destroy/move between stash, bet and winners pot |
+| Coins | `CoinsEffect`, `RaiseEffect` | create/destroy/move between stash, bet and winners pot |
 | Trigger | `TriggerCardEffects` | runs another trigger on the target cards |
 | Swap | `Swap` | first target area vs the source card |
 | SkipTurn | `SkipTurn` | no-op inside a round (`SkipTurns` is consumed at round start) |
-| Mark | `MarkCard` | pure VFX, modeled as a no-op |
+| Insight | `Insight` | opponent gains peek draws; the player side is a no-op (see below) |
+| Ignite | `Ignite` | marks targets; a second mark burns (exhausts) the card |
+| Mark | `MarkCard`, `FamilyTrioGraphVersion` | pure VFX/UI, modeled as no-ops |
 
 ### Targeting
 
@@ -62,10 +65,11 @@ Activation conditions are evaluated for `HasBlackJack`, `CanRaise` and constant-
 Anything not listed above — `ShuffleDeck`, `Demand`, `PlayCard`, `QueensGift`,
 `RotateCards`, `Transform`, `InsertCards`, `GainCardValue`, `Purge`, the trio/trap
 events, non-constant coin/amount collectors, random choices, and so on — is skipped.
-The plugin logs each distinct one once:
+The plugin logs each distinct card/effect once, with the card name so it can be
+prioritized:
 
 ```
-Unmodeled card effect: ShuffleDeck (the search treats it as a no-op).
+Unmodeled card effect: Death_Ignite: Ignite (the search treats it as a no-op).
 ```
 
 A card with more than four modeled effects is treated as effect-free for the same
@@ -91,7 +95,13 @@ space to remove:
 - **Deck insertions.** `Duplicate.ToDeck` inserts at a random position, so it is
   unmodeled; `MoveCard` to the draw pile uses the top of the pile.
 - **Reshuffles.** Drawing from an empty draw pile stops — the game would shuffle the
-  discard pile in a random order first.
+  discard pile in a random order first. `Discard`'s "discard from a draw pile, then
+  shuffle the discard back in" is modeled as the removal only, which matches until the
+  pile would empty.
+- **Insight.** The player already sees every card and reorders the pile through the
+  plugin's insight dialog, so player-side `Insight` is a no-op in the search; the
+  opponent's `Insight` adds peek draws to its draw policy. `ForceDiscardAce` and
+  `InsightOnOpposer` are unmodeled.
 - **Discard-pile contents.** Only the count is known; effects that need to take specific
   cards from the discard pile are unmodeled.
 - **Face-down cards.** Treated as revealed (the reveal effects themselves are modeled
@@ -102,16 +112,35 @@ space to remove:
   change the outcome are covered as far as the activation conditions above go.
 - **Settling order.** `ResolutionBeforeCount` and `ResolutionAfterCount` run before the
   winner is compared; the game may count between them.
+- **Endless effect loops.** A hollow card that duplicates itself back into the sleeve can
+  be played forever, so the game tree is not finite in general. The search bounds every
+  line by recursion depth and by player decisions without draw-pile progress; at the cap
+  the line is scored at the current resolution, and the decision log marks the result
+  with a "search cap" note. Legitimate rounds finish far below both caps.
+- **Ignite burn reactions.** The burn removes the card; effects that react to an
+  `Ignited` card gaining a modifier are not modeled (none exist inside the draw phase as
+  decompiled).
 
 ## Data flow
 
 ```
 GameCard.CardEffectContainers
   -> EffectsMapper.Map          (managed, main thread at capture time)
-  -> SolverEffect[per card]     (flat records, protocol v2)
+  -> SolverEffect[per card]     (flat records, protocol v3)
   -> effects.rs apply_play / apply_trigger
   -> State mutations            (values, types, tables, coins) during the search
 ```
 
-The trace in the decision log replays the expected line with those mutations applied, so
-the logged resolve line shows the post-effect totals the search used.
+Each search runs on a dedicated native thread with a large stack, and the trace in the
+decision log replays the expected line with those mutations applied. Every trace step
+carries the table values, bets and stashes right after it, so effect-driven changes show
+up even without a player move:
+
+```
+Expected line:
+  you play top [7] (P 21 vs O 22, bet 2/4)
+  opponent passes
+  you play top [11/1] (P 21 vs O 22, bet 2/4)
+  ...
+  resolve: win (21 vs 22) (bet 4/4)
+```
