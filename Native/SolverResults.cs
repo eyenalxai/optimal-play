@@ -90,7 +90,7 @@ namespace BlackJacket.OptimalPlay
     /// <summary>Human readable rendering of solver results for logs and the status line.</summary>
     internal static class SolverReport
     {
-        internal const string ProgressNote = "progress tie-break: played a dead card instead of passing";
+        internal const string ProgressNote = "progress tie-break: played a card instead of passing";
         internal const string DepthNote = "search cap: an endless effect loop was cut off at a horizon";
 
         internal static string MoveLabel(SolverMove move, SolverState s)

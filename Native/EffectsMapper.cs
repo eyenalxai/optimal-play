@@ -81,6 +81,7 @@ namespace BlackJacket.OptimalPlay
         internal const byte FlagSuppressOnBlackjack = 2;
         internal const byte FlagReactSameTable = 4;
         internal const byte FlagReactOtherTable = 8;
+        internal const byte FlagExcludeSource = 16;
 
         // Activation conditions.
         internal const byte CondNone = 0;
@@ -157,10 +158,10 @@ namespace BlackJacket.OptimalPlay
                 }
                 foreach (CardEffect effect in effects)
                 {
-                    List<SolverEffect> specs = MapEffect(effect);
+                    List<SolverEffect> specs = MapEffect(effect, out string reason);
                     if (specs == null)
                     {
-                        unmodeled.Add($"{card.name}: {effect?.GetType().Name ?? "empty effect"}");
+                        unmodeled.Add($"{card.name}: {effect?.GetType().Name ?? "empty effect"} ({reason})");
                         continue;
                     }
                     Assign(specs, trigger, flags, cond, condCmp, condA, condB, mapped);
@@ -169,7 +170,7 @@ namespace BlackJacket.OptimalPlay
                     // lives on the other table.
                     if (effect is AnglerFishTrap && trigger != TriggerCardPlayedToTable)
                     {
-                        List<SolverEffect> reaction = MapEffect(effect);
+                        List<SolverEffect> reaction = MapEffect(effect, out _);
                         if (reaction != null)
                         {
                             Assign(reaction, TriggerCardPlayedToTable, FlagReactOtherTable, 0, 0, 0, 0, mapped);
@@ -273,20 +274,24 @@ namespace BlackJacket.OptimalPlay
             public int Owner;
             public int Location;
             public uint Filter;
+            public bool ExcludeSource;
         }
 
         /// <summary>
         /// Combine the target sources an effect class can carry (relative card positions,
         /// a universal gather config and a simple card target config). Returns false when
-        /// the combination cannot be represented by the native target kinds.
+        /// the combination cannot be represented by the native target kinds; `error` then
+        /// names the reason for the unmodeled log.
         /// </summary>
         private static bool TryTargets(int relative, UniversalCardTargetConfig universal,
-            CardTargetConfiguration config, out TargetSpec spec)
+            CardTargetConfiguration config, out TargetSpec spec, out string error)
         {
             spec = null;
+            error = null;
             int owner = 0;
             int location = 0;
             bool hasGather = false;
+            bool excludeSource = false;
             uint filter = 0;
 
             if (universal != null && universal.GatherCardsSteps != null && universal.GatherCardsSteps.Length > 0)
@@ -304,13 +309,16 @@ namespace BlackJacket.OptimalPlay
                             relative |= (int)byRelative.RelativePosition;
                             break;
                         default:
+                            error = $"gather step {step.GetType().Name}";
                             return false;
                     }
                 }
-                if (universal.ExcludeSourceCard || !TryFilter(universal.CardFilterSet, location, out filter))
+                if (!TryFilter(universal.CardFilterSet, location, out filter))
                 {
+                    error = "card filter set";
                     return false;
                 }
+                excludeSource = universal.ExcludeSourceCard;
             }
 
             if (config != null && !IsEmptyTargetConfig(config))
@@ -318,10 +326,12 @@ namespace BlackJacket.OptimalPlay
                 if (hasGather)
                 {
                     // Two independent gather sources in one effect: not representable.
+                    error = "two gather sources";
                     return false;
                 }
                 if (config.RemoveFaces != EFace.None || config.RemoveAces || config.RemoveNonFaces)
                 {
+                    error = "face/ace filter";
                     return false;
                 }
                 owner = (int)config.Owner;
@@ -331,6 +341,7 @@ namespace BlackJacket.OptimalPlay
 
             if (!hasGather && relative == 0)
             {
+                error = "no targets";
                 return false;
             }
 
@@ -340,6 +351,7 @@ namespace BlackJacket.OptimalPlay
                 Owner = owner,
                 Location = location,
                 Filter = filter,
+                ExcludeSource = excludeSource,
             };
             return true;
         }
@@ -351,7 +363,22 @@ namespace BlackJacket.OptimalPlay
             {
                 return true;
             }
-            if (set.Filters.Length != 1 || set.Filters[0] is not CardFilterSet.TakeNum take)
+            if (set.Filters.Length != 1)
+            {
+                return false;
+            }
+            if (set.Filters[0] is CardFilterSet.IsBrokenCardFilter)
+            {
+                // Only the count of a discard pile is modeled, so a content filter cannot
+                // look at it.
+                if ((location & (int)ELocation.DiscardPile) != 0)
+                {
+                    return false;
+                }
+                filter = 2u;
+                return true;
+            }
+            if (set.Filters[0] is not CardFilterSet.TakeNum take)
             {
                 return false;
             }
@@ -376,6 +403,10 @@ namespace BlackJacket.OptimalPlay
         private static SolverEffect WithTarget(byte op, TargetSpec spec)
         {
             var effect = new SolverEffect { Op = op, Filter = spec.Filter };
+            if (spec.ExcludeSource)
+            {
+                effect.Flags |= FlagExcludeSource;
+            }
             if (spec.Owner != 0)
             {
                 if (spec.Relative != 0)
@@ -404,25 +435,28 @@ namespace BlackJacket.OptimalPlay
         /// Map one effect instance to descriptors; null when the solver cannot model it.
         /// A few effects expand into more than one descriptor (Angler Fish Trap).
         /// </summary>
-        private static List<SolverEffect> MapEffect(CardEffect effect)
+        private static List<SolverEffect> MapEffect(CardEffect effect, out string reason)
         {
+            reason = null;
             switch (effect)
             {
                 case ApplyBroken broken:
                 {
-                    TargetSpec spec;
-                    if (!TryTargets(EnumInt(broken, "CardPositions"), null, null, out spec))
+                    if (!TryTargets(EnumInt(broken, "CardPositions"), null, null,
+                            out TargetSpec spec, out string error))
                     {
+                        reason = error;
                         return null;
                     }
                     return One(WithTarget(OpBreak, spec));
                 }
                 case ApplyMend mend:
                 {
-                    TargetSpec spec;
                     if (!TryTargets(EnumInt(mend, "CardPositions"),
-                            Field<UniversalCardTargetConfig>(mend, "_universalCardTargetConfig"), null, out spec))
+                            Field<UniversalCardTargetConfig>(mend, "_universalCardTargetConfig"), null,
+                            out TargetSpec spec, out string error))
                     {
+                        reason = error;
                         return null;
                     }
                     return One(WithTarget(OpMend, spec));
@@ -432,13 +466,15 @@ namespace BlackJacket.OptimalPlay
                     // Random card choices cannot be modeled deterministically.
                     if (EnumInt(modify, "cardChoiceMode") != 1)
                     {
+                        reason = "random card choice";
                         return null;
                     }
-                    TargetSpec spec;
                     if (!TryTargets(EnumInt(modify, "RelativeCardPosition"),
                             Field<UniversalCardTargetConfig>(modify, "_targetConfig"),
-                            Field<CardTargetConfiguration>(modify, "TargetConfiguration"), out spec))
+                            Field<CardTargetConfiguration>(modify, "TargetConfiguration"),
+                            out TargetSpec spec, out string error))
                     {
+                        reason = error;
                         return null;
                     }
                     SolverEffect mapped = WithTarget(EnumInt(modify, "modifierMode") == 1 ? OpSetValue : OpAddValue, spec);
@@ -448,28 +484,31 @@ namespace BlackJacket.OptimalPlay
                 }
                 case InvertValue invert:
                 {
-                    TargetSpec spec;
-                    if (!TryTargets(EnumInt(invert, "RelativeCardPosition"), null, null, out spec))
+                    if (!TryTargets(EnumInt(invert, "RelativeCardPosition"), null, null,
+                            out TargetSpec spec, out string error))
                     {
+                        reason = error;
                         return null;
                     }
                     return One(WithTarget(OpInvert, spec));
                 }
                 case Drain drain:
                 {
-                    TargetSpec spec;
                     if (!TryTargets(EnumInt(drain, "_relativeCardTargets"), null,
-                            Field<CardTargetConfiguration>(drain, "_cardTargetingConfig"), out spec))
+                            Field<CardTargetConfiguration>(drain, "_cardTargetingConfig"),
+                            out TargetSpec spec, out string error))
                     {
+                        reason = error;
                         return null;
                     }
                     return One(WithTarget(OpDrain, spec));
                 }
                 case GainHollow hollow:
                 {
-                    TargetSpec spec;
-                    if (!TryTargets(EnumInt(hollow, "_cardPosition"), null, null, out spec))
+                    if (!TryTargets(EnumInt(hollow, "_cardPosition"), null, null,
+                            out TargetSpec spec, out string error))
                     {
+                        reason = error;
                         return null;
                     }
                     return One(WithTarget(OpHollow, spec));
@@ -480,18 +519,20 @@ namespace BlackJacket.OptimalPlay
                     // when the pile empties. The search cannot model the random reshuffle,
                     // but removing the discarded cards from the pile is the right short-term
                     // behavior and the search stops at draw-pile exhaustion anyway.
-                    TargetSpec spec;
-                    if (!TryTargets((int)discard.RelativeCardPosition, discard.CardTargetConfig, null, out spec))
+                    if (!TryTargets((int)discard.RelativeCardPosition, discard.CardTargetConfig, null,
+                            out TargetSpec spec, out string error))
                     {
+                        reason = error;
                         return null;
                     }
                     return One(WithTarget(OpDiscard, spec));
                 }
                 case Exhaust exhaust:
                 {
-                    TargetSpec spec;
-                    if (!TryTargets(0, Field<UniversalCardTargetConfig>(exhaust, "_targetConfig"), null, out spec))
+                    if (!TryTargets(0, Field<UniversalCardTargetConfig>(exhaust, "_targetConfig"), null,
+                            out TargetSpec spec, out string error))
                     {
+                        reason = error;
                         return null;
                     }
                     return One(WithTarget(OpExhaust, spec));
@@ -502,18 +543,21 @@ namespace BlackJacket.OptimalPlay
                     CardLocationConfig target = Field<CardLocationConfig>(move, "_targetConfig");
                     if (source == null || target == null)
                     {
+                        reason = "missing move location";
                         return null;
                     }
                     int sourceLocation = (int)source.Location;
                     // Discard pile contents are not modeled, so it cannot be a source.
                     if ((sourceLocation & (int)ELocation.DiscardPile) != 0 || sourceLocation == 0)
                     {
+                        reason = "discard pile source";
                         return null;
                     }
                     int mode = EnumInt(move, "_mode");
                     if (mode == 2)
                     {
-                        return null; // Random selection
+                        reason = "random selection";
+                        return null;
                     }
                     int destination;
                     if (((int)target.Location & (int)ELocation.DrawPile) != 0)
@@ -534,6 +578,7 @@ namespace BlackJacket.OptimalPlay
                     }
                     else
                     {
+                        reason = "unknown move destination";
                         return null;
                     }
 
@@ -557,6 +602,7 @@ namespace BlackJacket.OptimalPlay
                     CardLocationConfig target = Field<CardLocationConfig>(draw, "_targetLocation");
                     if (target == null || (int)target.Location == 0)
                     {
+                        reason = "missing draw location";
                         return null;
                     }
                     var mapped = new SolverEffect
@@ -575,7 +621,8 @@ namespace BlackJacket.OptimalPlay
                     int mode = EnumInt(duplicate, "Mode");
                     if (mode == 1)
                     {
-                        return null; // ToDeck inserts at a random position
+                        reason = "random deck position";
+                        return null;
                     }
                     var mapped = new SolverEffect
                     {
@@ -590,6 +637,7 @@ namespace BlackJacket.OptimalPlay
                 {
                     if (!IsEmptyAmountCollector(exploit.amountCollector))
                     {
+                        reason = "amount collector";
                         return null;
                     }
                     return One(new SolverEffect { Op = OpExploit, Target = TargetNone, A = exploit.Amount });
@@ -600,12 +648,14 @@ namespace BlackJacket.OptimalPlay
                         || !IsEmptyCollector(coins.AddAmount)
                         || !IsEmptyTargetConfig(coins.AddAmountByCards))
                     {
+                        reason = "coin collector targets cards";
                         return null;
                     }
                     int sourceZone = (int)coins.SourceZone;
                     int targetZone = (int)coins.TargetZone;
                     if (!SingleZone(sourceZone) || !SingleZone(targetZone))
                     {
+                        reason = "multi-zone coin move";
                         return null;
                     }
                     if (sourceZone == 0 && targetZone == 0)
@@ -626,9 +676,10 @@ namespace BlackJacket.OptimalPlay
                     return One(new SolverEffect { Op = OpSkipTurn, Target = TargetNone });
                 case TriggerCardEffects trigger:
                 {
-                    TargetSpec spec;
-                    if (!TryTargets((int)trigger.RelativeCardPosition, null, trigger.CardTargetConfiguration, out spec))
+                    if (!TryTargets((int)trigger.RelativeCardPosition, null, trigger.CardTargetConfiguration,
+                            out TargetSpec spec, out string error))
                     {
+                        reason = error;
                         return null;
                     }
                     SolverEffect mapped = WithTarget(OpTrigger, spec);
@@ -637,9 +688,10 @@ namespace BlackJacket.OptimalPlay
                 }
                 case Swap swap:
                 {
-                    TargetSpec spec;
-                    if (!TryTargets(EnumInt(swap, "TargetCardPosition"), null, null, out spec))
+                    if (!TryTargets(EnumInt(swap, "TargetCardPosition"), null, null,
+                            out TargetSpec spec, out string error))
                     {
+                        reason = error;
                         return null;
                     }
                     return One(WithTarget(OpSwap, spec));
@@ -655,10 +707,11 @@ namespace BlackJacket.OptimalPlay
                 }
                 case Ignite ignite:
                 {
-                    TargetSpec spec;
                     if (!TryTargets(EnumInt(ignite, "RelativeTarget"), null,
-                            Field<CardTargetConfiguration>(ignite, "_targetConfiguration"), out spec))
+                            Field<CardTargetConfiguration>(ignite, "_targetConfiguration"),
+                            out TargetSpec spec, out string error))
                     {
+                        reason = error;
                         return null;
                     }
                     return One(WithTarget(OpIgnite, spec));
@@ -670,6 +723,9 @@ namespace BlackJacket.OptimalPlay
                     if (insight.ForceDiscardAce || insight.InsightOnOpposer
                         || !IsEmptyAmountCollector(insight.AmountCollector))
                     {
+                        reason = insight.ForceDiscardAce ? "forces the ace"
+                            : insight.InsightOnOpposer ? "opponent deck insight"
+                            : "amount collector";
                         return null;
                     }
                     return One(new SolverEffect
@@ -683,6 +739,7 @@ namespace BlackJacket.OptimalPlay
                 {
                     if (!IsEmptyAmountCollector(raise.amountCollector))
                     {
+                        reason = "amount collector";
                         return null;
                     }
                     // Greed turns the raise into a forced raise paid from the other side.
@@ -706,6 +763,7 @@ namespace BlackJacket.OptimalPlay
                     // Purely cosmetic (card back / mark VFX).
                     return One(new SolverEffect { Op = OpNone, Target = TargetNone });
                 default:
+                    reason = "unsupported effect";
                     return null;
             }
         }

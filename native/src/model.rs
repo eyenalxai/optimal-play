@@ -40,6 +40,8 @@ pub const EF_OPTIONAL: u8 = 1 << 0;
 pub const EF_SUPPRESS_ON_BLACKJACK: u8 = 1 << 1;
 pub const EF_REACT_SAME_TABLE: u8 = 1 << 2;
 pub const EF_REACT_OTHER_TABLE: u8 = 1 << 3;
+/// A gathered target list drops the source card (`UniversalCardTargetConfig.ExcludeSourceCard`).
+pub const EF_EXCLUDE_SOURCE: u8 = 1 << 4;
 
 /// Longest effect list a card may carry. Cards with more effects are reported as
 /// unmodeled by the managed mapper instead of being truncated silently.

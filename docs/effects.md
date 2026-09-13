@@ -55,8 +55,12 @@ identity) marks the whole container unmodeled.
 - Gather steps (`GatherCardsByLocation`) resolve owner bits (player/opponent/self/other)
   and locations (table, draw pile, discard pile, sleeve — sleeve only exists for the
   player). At most one location gather plus one relative gather per effect.
+  `UniversalCardTargetConfig.ExcludeSourceCard` drops the source card from the gathered
+  list; the legacy relative positions are not affected.
 - `CardFilterSet.TakeNum` first/last is packed into the record; random takes are
-  unmodeled. Other filters mark the effect unmodeled.
+  unmodeled. `IsBrokenCardFilter` keeps cards with a `Broken` value, but is unmodeled
+  when the gather includes the discard pile (only its count is known). Any other filter
+  marks the effect unmodeled.
 - `CardTargetConfiguration` is supported when it only selects by owner/location (no
   face/ace/value removal).
 
@@ -65,11 +69,11 @@ identity) marks the whole container unmodeled.
 Anything not listed above — `ShuffleDeck`, `Demand`, `PlayCard`, `QueensGift`,
 `RotateCards`, `Transform`, `InsertCards`, `GainCardValue`, `Purge`, the trio/trap
 events, non-constant coin/amount collectors, random choices, and so on — is skipped.
-The plugin logs each distinct card/effect once, with the card name so it can be
-prioritized:
+The plugin logs each distinct card/effect once, with the card name and the reason the
+mapping failed so it can be prioritized:
 
 ```
-Unmodeled card effect: Death_Ignite: Ignite (the search treats it as a no-op).
+Unmodeled card effect: GameCard_Flames_9_Upgraded: InsertCards (unsupported effect) (the search treats it as a no-op).
 ```
 
 A card with more than four modeled effects is treated as effect-free for the same

@@ -147,11 +147,12 @@ the solver plays them exactly like the game scores them.
 Two rules keep those cards from stalling the bot:
 
 - **Progress tie-break.** Losing a round costs your bet no matter how you lose it. When every
-  move (including passing) is worth the same non-positive amount and the top card is a dead
-  card (best value <= 0), the bot plays it instead of passing. Passing forever would leave
-  that card stuck on top of the draw pile and never reach the rest of the deck. Dead *sleeve*
-  cards are not preferred: a sleeve play consumes no deck position, so a card that returns to
-  the sleeve would otherwise be played forever.
+  move (including passing) is worth the same non-positive amount, the bot plays a card
+  instead of passing: a dead top card (best value <= 0) keeps the deck moving, a dead sleeve
+  card clears the sleeve, and when the draw pile is already empty any sleeve play that
+  actually removes the card qualifies (the round cannot be won by saving cards either). A
+  card that duplicates itself back into the sleeve is never chosen by this rule, so it
+  cannot be played every turn.
 - **Playing to the opponent's table.** Cards with *"Play into any slot."* (the game's
   `CanBePlayedInOpponentsSlots`) can be dropped on the opponent's side; the solver considers
   both sides and uses whichever is better. The search models the value change on either

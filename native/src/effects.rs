@@ -367,30 +367,37 @@ fn gather_location(state: &State, side: usize, location: i32) -> SmallVec<[Spot;
     out
 }
 
-fn apply_take_filter(targets: &mut SmallVec<[Spot; 8]>, filter: u32) {
+fn apply_take_filter(state: &State, targets: &mut SmallVec<[Spot; 8]>, filter: u32) {
     let kind = filter & 0xF;
-    if kind != 1 {
-        return;
-    }
-    let mode = (filter >> 4) & 0x3;
-    let count = ((filter >> 6) & 0xFFF) as usize;
-    match mode {
-        0 => targets.truncate(count),
+    match kind {
+        // TakeNum: keep the first/last `count` targets.
         1 => {
-            if targets.len() > count {
-                let drop = targets.len() - count;
-                targets.drain(..drop);
+            let mode = (filter >> 4) & 0x3;
+            let count = ((filter >> 6) & 0xFFF) as usize;
+            match mode {
+                0 => targets.truncate(count),
+                1 => {
+                    if targets.len() > count {
+                        let drop = targets.len() - count;
+                        targets.drain(..drop);
+                    }
+                }
+                // Random selection cannot be modeled deterministically; the mapper marks
+                // those effects unmodeled and the first cards stand in here.
+                _ => targets.truncate(count),
             }
         }
-        // Random selection cannot be modeled deterministically; the mapper marks
-        // those effects unmodeled and the first cards stand in here.
-        _ => targets.truncate(count),
+        // IsBrokenCardFilter: keep only cards with a Broken value. The game's filter
+        // ignores its `_isBroken` field and always matches broken cards.
+        2 => targets.retain(|spot| card_at(state, *spot).is_some_and(|card| card.is_broken())),
+        _ => {}
     }
 }
 
 /// Cards selected by an effect's target specification.
 pub fn gather_targets(state: &State, source: Spot, effect: &Effect) -> SmallVec<[Spot; 8]> {
     let mut out: SmallVec<[Spot; 8]> = SmallVec::new();
+    let exclude_source = effect.flags & crate::model::EF_EXCLUDE_SOURCE != 0;
     match effect.target {
         TARGET_SOURCE => push_unique(&mut out, source),
         TARGET_RELATIVE => {
@@ -399,16 +406,22 @@ pub fn gather_targets(state: &State, source: Spot, effect: &Effect) -> SmallVec<
         TARGET_GATHER => {
             for side in owner_sides(source.side, effect.t1) {
                 for spot in gather_location(state, side, effect.t2) {
+                    if exclude_source && spot == source {
+                        continue;
+                    }
                     push_unique(&mut out, spot);
                 }
             }
         }
         TARGET_RELATIVE_AND_GATHER => {
-            for spot in relative_targets(state, source, effect.t1) {
-                push_unique(&mut out, spot);
-            }
+            // The exclusion and the card filter apply to the gather part only: the game
+            // concatenates the relative targets after filtering the gathered ones.
+            out = relative_targets(state, source, effect.t1);
             for side in owner_sides(source.side, effect.t2) {
                 for spot in gather_location(state, side, effect.t3) {
+                    if exclude_source && spot == source {
+                        continue;
+                    }
                     push_unique(&mut out, spot);
                 }
             }
@@ -422,7 +435,7 @@ pub fn gather_targets(state: &State, source: Spot, effect: &Effect) -> SmallVec<
         }
         _ => {}
     }
-    apply_take_filter(&mut out, effect.filter);
+    apply_take_filter(state, &mut out, effect.filter);
     out
 }
 

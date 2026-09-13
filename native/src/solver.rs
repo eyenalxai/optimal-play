@@ -122,7 +122,7 @@ pub struct Eval {
 /// Heuristic nudges and search-limit flags of a root result; surfaced in the plugin log.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct Note {
-    /// The chosen move was swapped for the progress tie-break (a dead card over a pass).
+    /// The chosen move was swapped for the progress tie-break (a play over a pass).
     pub progress_tie_break: bool,
     /// An effect loop forced the search to score a line at the depth or stall cap;
     /// values below that point are horizon estimates.
@@ -1107,24 +1107,64 @@ fn greedy_move(s: &State) -> Move {
     Move::pass()
 }
 
-/// Deck-progress nudge: among the moves that tie the best (non-positive) value, prefer
-/// playing a dead top card over passing, so the deck keeps moving. Sleeve plays are
-/// deliberately excluded: they consume no deck position, so preferring them can turn a
-/// card that returns to the sleeve into an endless play loop.
+/// Progress nudge: among the moves that tie the best (non-positive) value, prefer
+/// playing a card over passing so the position keeps moving. A dead top card cycles the
+/// deck; a dead sleeve card clears the sleeve. When the draw pile is already empty the
+/// round cannot be won by saving cards either, so any sleeve play that removes the card
+/// qualifies. A card that puts itself back into the sleeve is never chosen, since it
+/// would be played every turn.
 fn progress_move(root: &State, evaluations: &[Eval], best: f32) -> Move {
     const EPS: f32 = 0.0001;
+    let deck_empty = root.p.top().is_none();
+    let mut dead: SmallVec<[Move; 8]> = SmallVec::new();
+    let mut other: SmallVec<[Move; 8]> = SmallVec::new();
 
     for eval in evaluations {
         if eval.value < best - EPS {
             continue;
         }
-        if eval.mv.kind == MoveKind::PlayTop
-            && let Some(top) = root.p.top()
-            && top.is_dead()
-        {
-            return eval.mv;
+        match eval.mv.kind {
+            MoveKind::PlayTop => {
+                if let Some(top) = root.p.top()
+                    && top.is_dead()
+                {
+                    return eval.mv;
+                }
+            }
+            MoveKind::PlaySleeve => {
+                let index = eval.mv.sleeve_index;
+                if index >= 0
+                    && let Some(card) = root.p.sleeve.get(index as usize)
+                {
+                    if card.is_dead() {
+                        dead.push(eval.mv);
+                    } else if deck_empty {
+                        other.push(eval.mv);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
+    for mv in dead.into_iter().chain(other) {
+        if sleeve_play_removes_card(root, mv) {
+            return mv;
+        }
+    }
     Move::pass()
+}
+
+/// True when playing `mv` lowers how many cards equal to it sit in the sleeve. Counting
+/// occurrences (instead of asking whether an equal card remains) keeps duplicate-valued
+/// cards distinct: only a card that puts itself back keeps the count from dropping.
+fn sleeve_play_removes_card(root: &State, mv: Move) -> bool {
+    let Some(card) = root.p.sleeve.get(mv.sleeve_index as usize) else {
+        return false;
+    };
+    let before = root.p.sleeve.iter().filter(|c| *c == card).count();
+    match apply_player_move(root, mv) {
+        Some((child, _)) => child.p.sleeve.iter().filter(|c| *c == card).count() < before,
+        None => false,
+    }
 }
