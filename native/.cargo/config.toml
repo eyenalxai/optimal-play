@@ -1,0 +1,5 @@
+# The game runs as a Windows x64 process (even under Proton), so the plugin ships
+# the cdylib built for x86_64-pc-windows-gnu. A static CRT keeps it self-contained:
+# no mingw runtime DLLs have to be deployed next to the game.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]

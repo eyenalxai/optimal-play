@@ -23,6 +23,12 @@ loss -> - your bet (blind + sleeve costs, exactly like the game books them)
 tie  ->  0
 ```
 
+The search itself lives in a native Rust library (`OptimalPlaySolver.dll`) and runs on a
+background thread with the solver budget from the config, so the draw phase never stalls
+on a search and hard positions can get a full second of thought. Candidate sets (insight
+arrangements, demand picks, card choices, shuffle samples) are evaluated in parallel.
+The managed plugin only captures the position, submits the job and executes the answer.
+
 Because card order is known, the bot can do things a human cannot: it knows when the
 opponent is about to bust, when a card is safe to sleeve, and when standing pat already
 wins the round. It also understands blackjack (two-card 21), busts, the single-card
@@ -68,8 +74,8 @@ Optional card-effect prompts are answered with `AutoActivateOptionalEffects`.
 | `DumpStateKey` | `F9` | Log the current position and full move analysis once, without acting. |
 | `VerboseKey` | `F10` | Toggle `LogState` at runtime. |
 | `ShowStatus` | `true` | Small status line showing the current decision. |
-| `SearchNodeBudget` | `250000` | Maximum search nodes per decision. |
-| `SearchTimeMs` | `200` | Maximum search time per decision. |
+| `SearchNodeBudget` | `2000000` | Maximum search nodes per decision (safety cap; searches stop early when solved). |
+| `SearchTimeMs` | `1000` | Maximum search time per decision, in milliseconds. Searches run on a background thread. |
 
 ## Reading the log
 
@@ -128,11 +134,29 @@ Two rules keep those cards from stalling the bot:
   both sides and uses whichever is better. The search models the value change on either
   table exactly, including the opponent's reaction.
 
+## Build
+
+```bash
+./build.sh
+```
+
+This cross-builds `native/` for `x86_64-pc-windows-gnu` (rustup nightly, static CRT via
+`native/.cargo/config.toml`) and then `dotnet build -c Release`, staging both
+`bin/Release/OptimalPlay.dll` and `bin/Release/OptimalPlaySolver.dll`. The only system
+dependency beyond rustup/dotnet is the mingw-w64 linker: `sudo pacman -S mingw-w64-gcc`.
+
+`native/` is a normal cargo crate, so `cargo build --release` on the host builds a Linux
+`.so` for local checks; the plugin uses the Windows DLL.
+
 ## Install
 
 1. Install BepInEx 5 for Black Jacket.
-2. Copy `OptimalPlay.dll` to `BepInEx/plugins/OptimalPlay/`.
+2. Copy `OptimalPlay.dll` and `OptimalPlaySolver.dll` to `BepInEx/plugins/OptimalPlay/`.
 3. Start a match; the draw phase is played automatically.
+
+The plugin logs `Native solver loaded.` on startup. If the native library is missing or
+was built for a different protocol version, it logs `Native solver unavailable (...)` and
+leaves all input manual.
 
 ## Limitations
 

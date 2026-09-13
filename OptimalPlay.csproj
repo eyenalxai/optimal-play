@@ -5,7 +5,7 @@
     <LangVersion>latest</LangVersion>
     <AssemblyName>OptimalPlay</AssemblyName>
     <RootNamespace>BlackJacket.OptimalPlay</RootNamespace>
-    <Version>1.3.0</Version>
+    <Version>2.0.0</Version>
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
@@ -54,5 +54,14 @@
       <Private>false</Private>
     </Reference>
   </ItemGroup>
+
+  <!-- Stage the native solver next to the plugin whenever it has been built, so a plain
+       `dotnet build` after `build.sh` (or a manual cargo build) ships both DLLs together.
+       The crate output is snake_case; the loader expects the PascalCase name. -->
+  <Target Name="CopyNativeSolver" AfterTargets="Build"
+          Condition="Exists('$(MSBuildProjectDirectory)/native/target/x86_64-pc-windows-gnu/release/optimal_play_solver.dll')">
+    <Copy SourceFiles="$(MSBuildProjectDirectory)/native/target/x86_64-pc-windows-gnu/release/optimal_play_solver.dll"
+          DestinationFiles="$(OutDir)OptimalPlaySolver.dll" />
+  </Target>
 
 </Project>

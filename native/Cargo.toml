@@ -1,0 +1,19 @@
+[package]
+name = "optimal-play-solver"
+version = "0.1.0"
+edition = "2024"
+description = "Perfect-information draw phase solver for Black Jacket, called from the BepInEx plugin through a C ABI."
+license = "MIT"
+
+[lib]
+name = "optimal_play_solver"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rayon = "1.11"
+smallvec = "1.15"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

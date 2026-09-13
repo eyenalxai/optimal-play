@@ -9,7 +9,9 @@ using UnityEngine.UI;
 namespace BlackJacket.OptimalPlay
 {
     /// <summary>
-    /// Drives the player's draw phase with the perfect-information solver.
+    /// Drives the player's draw phase with the perfect-information native solver. Searches
+    /// run on <see cref="SolverWorker"/>; this component only captures positions on the Unity
+    /// main thread, submits jobs and executes the returned move once the job completes.
     /// </summary>
     internal sealed class AutoPilot : MonoBehaviour
     {
@@ -22,6 +24,17 @@ namespace BlackJacket.OptimalPlay
         private Canvas _statusCanvas;
         private int _errorCount;
         private bool _overlayFailed;
+
+        // In-flight search for the current turn. The captured position is dropped whenever
+        // the turn changes while the search runs, so a stale plan is never executed.
+        private SolverJob<SolveResult> _decisionJob;
+        private SolverState _decisionState;
+        private int _decisionRevision;
+        private object _decisionMatch;
+
+        // In-flight search behind the F9 diagnostics dump.
+        private SolverJob<SolveResult> _dumpJob;
+        private SolverState _dumpState;
 
         private void Update()
         {
@@ -43,6 +56,7 @@ namespace BlackJacket.OptimalPlay
             Settings cfg = OptimalPlayPlugin.Cfg;
             if (cfg == null || !cfg.Enabled.Value)
             {
+                CancelDecision();
                 SetStatus("");
                 return;
             }
@@ -59,9 +73,12 @@ namespace BlackJacket.OptimalPlay
             if (gc == null || gc.UI == null || gc.State == null
                 || gc.State.Player == null || gc.State.Opponent == null)
             {
+                CancelDecision();
                 SetStatus("");
                 return;
             }
+
+            PollDump();
 
             if (cfg.VerboseKey.Value.IsDown())
             {
@@ -109,18 +126,21 @@ namespace BlackJacket.OptimalPlay
 
             if (!cfg.AutoPlay.Value)
             {
+                CancelDecision();
                 SetStatus("AUTO-PLAY: off");
                 return;
             }
 
             if (!Progression.HasPlayedTutorial)
             {
+                CancelDecision();
                 SetStatus("AUTO-PLAY: waiting (tutorial)");
                 return;
             }
 
             if (gc.CurrentMatch == null)
             {
+                CancelDecision();
                 SetStatus("");
                 return;
             }
@@ -129,7 +149,26 @@ namespace BlackJacket.OptimalPlay
 
             if (!IsPlayerTurn(gc, ps))
             {
+                CancelDecision();
                 SetStatus("");
+                return;
+            }
+
+            if (!NativeSolver.Available)
+            {
+                CancelDecision();
+                SetStatus("AUTO: native solver unavailable (see log)");
+                return;
+            }
+
+            if (_decisionJob != null)
+            {
+                if (!_decisionJob.Done)
+                {
+                    SetStatus("AUTO: thinking...");
+                    return;
+                }
+                CompleteDecision(gc, cfg, ps);
                 return;
             }
 
@@ -146,8 +185,7 @@ namespace BlackJacket.OptimalPlay
                 return;
             }
 
-            _cooldown = Delay(cfg);
-            DecideAndPlay(gc, ps);
+            StartDecision(cfg, gc, ps);
         }
 
         private static bool IsPlayerTurn(GameController gc, PlayerState ps)
@@ -182,101 +220,190 @@ namespace BlackJacket.OptimalPlay
 
         // ---------------------------------------------------------------- decision
 
-        private void DecideAndPlay(GameController gc, PlayerState ps)
+        private void StartDecision(Settings cfg, GameController gc, PlayerState ps)
         {
-            Settings cfg = OptimalPlayPlugin.Cfg;
-            SolverState sim = BuildSim(gc, ps);
-            RoundSolver solver = MakeSolver(cfg);
+            _decisionState = BuildSim(gc, ps);
+            _decisionRevision = Revision(gc, ps);
+            _decisionMatch = gc.CurrentMatch;
+            SubmitDecision(cfg);
+        }
 
-            SolverMove move = solver.BestMove(sim, out float value, out int nodes, out bool aborted,
-                out List<MoveEvaluation> evaluations);
+        private void SubmitDecision(Settings cfg)
+        {
+            SolverState state = _decisionState;
+            int nodes = Mathf.Max(1000, cfg.SearchNodeBudget.Value);
+            int timeMs = Mathf.Max(20, cfg.SearchTimeMs.Value);
+            _decisionJob = SolverWorker.Post(() => NativeSolver.Solve(state, nodes, timeMs));
+        }
 
-            // If the game cannot pay for a sleeve draw after all, solve again without it.
-            if (move.Kind == MoveKind.SleeveTop && !gc.PlayerCanDrawToSleeve())
+        private void CompleteDecision(GameController gc, Settings cfg, PlayerState ps)
+        {
+            SolverJob<SolveResult> job = _decisionJob;
+            _decisionJob = null;
+            SolverState sim = _decisionState;
+            _decisionState = null;
+
+            if (job.Error != null)
+            {
+                OptimalPlayPlugin.Log.LogError($"Solver failed: {job.Error.Message}");
+                _cooldown = Delay(cfg);
+                return;
+            }
+
+            // The player may have acted manually while the search ran; never execute a plan
+            // that was computed for a different position.
+            if (sim == null || !ReferenceEquals(_decisionMatch, gc.CurrentMatch) || Revision(gc, ps) != _decisionRevision)
+            {
+                return;
+            }
+
+            SolveResult result = job.Result;
+
+            // The game cannot pay for a sleeve draw after all: solve again without it.
+            if (result.Best.Kind == MoveKind.SleeveTop && !gc.PlayerCanDrawToSleeve())
             {
                 sim.SleeveSize = 0;
                 sim.Payable = 0;
-                move = solver.BestMove(sim, out value, out nodes, out aborted, out evaluations);
+                _decisionState = sim;
+                _decisionRevision = Revision(gc, ps);
+                SubmitDecision(cfg);
+                return;
             }
 
             if (cfg.LogDecisions.Value)
             {
                 var sb = new StringBuilder();
-                sb.Append("Decision: ").Append(RoundSolver.MoveLabel(move, sim));
-                sb.Append(" | P ").Append(sim.PValue).Append(" vs O ").Append(sim.OValue);
-                if (!float.IsNaN(value))
+                sb.Append("Decision: ").Append(SolverReport.MoveLabel(result.Best, sim));
+                sb.Append(" | P ").Append(result.PValue).Append(" vs O ").Append(result.OValue);
+                if (!float.IsNaN(result.Value))
                 {
-                    sb.Append(" | ev ").Append(value.ToString("+0.##;-0.##;0"));
+                    sb.Append(" | ev ").Append(SolverReport.Format(result.Value));
                 }
-                sb.Append(" | ").Append(nodes).Append(" nodes");
-                if (aborted)
+                sb.Append(" | ").Append(result.Nodes).Append(" nodes");
+                if (result.Aborted)
                 {
                     sb.Append(" (budget reached, greedy fallback)");
                 }
-                if (solver.Note != null)
+                if (result.ProgressTieBreak)
                 {
-                    sb.Append(" [").Append(solver.Note).Append(']');
+                    sb.Append(" [").Append(SolverReport.ProgressNote).Append(']');
                 }
+                var ranked = new List<MoveEvaluation>(result.Evaluations);
+                ranked.Sort((a, b) => b.Value.CompareTo(a.Value));
                 sb.Append(" | options: ");
-                sb.Append(string.Join(", ",
-                    evaluations.OrderByDescending(e => e.Value).Take(4)
-                        .Select(e => $"{RoundSolver.MoveLabel(e.Move, sim)}={e.Value:+0.##;-0.##;0}")));
+                for (int i = 0; i < ranked.Count && i < 4; i++)
+                {
+                    if (i > 0)
+                    {
+                        sb.Append(", ");
+                    }
+                    sb.Append(SolverReport.MoveLabel(ranked[i].Move, sim))
+                        .Append('=').Append(SolverReport.Format(ranked[i].Value));
+                }
                 OptimalPlayPlugin.Log.LogInfo(sb.ToString());
             }
 
             if (cfg.LogState.Value)
             {
                 var sb = new StringBuilder();
-                AppendReport(sb, "decision", sim, solver, move, value, nodes, aborted, evaluations);
+                AppendReport(sb, "decision", sim, result);
                 OptimalPlayPlugin.Log.LogInfo(sb.ToString());
             }
 
-            SetStatus($"AUTO: {RoundSolver.MoveLabel(move, sim)}  (P {ps.TableValue} vs O {gc.State.Opponent.TableValue})");
-            ExecuteMove(gc, sim, move);
+            SetStatus($"AUTO: {SolverReport.MoveLabel(result.Best, sim)}  (P {ps.TableValue} vs O {gc.State.Opponent.TableValue})");
+            ExecuteMove(gc, sim, result.Best);
+            _cooldown = Delay(cfg);
         }
 
-        private static RoundSolver MakeSolver(Settings cfg)
+        private void CancelDecision()
         {
-            return new RoundSolver
+            _decisionJob = null;
+            _decisionState = null;
+        }
+
+        /// <summary>
+        /// Cheap fingerprint of the position the search was started from. If any of these
+        /// change while a search runs, the answer is dropped and a fresh one is requested.
+        /// </summary>
+        private static int Revision(GameController gc, PlayerState ps)
+        {
+            PlayerState os = gc.State.Opponent;
+            unchecked
             {
-                NodeBudget = Mathf.Max(1000, cfg.SearchNodeBudget.Value),
-                TimeBudgetMs = Mathf.Max(20, cfg.SearchTimeMs.Value),
-            };
+                int hash = ps.DrawPile.CardAmount;
+                hash = (hash * 397) ^ ps.DiscardPile.CardAmount;
+                hash = (hash * 397) ^ ps.TableDropArea.Cards.Length;
+                hash = (hash * 397) ^ os.TableDropArea.Cards.Length;
+                hash = (hash * 397) ^ ps.Bet.CoinValue;
+                hash = (hash * 397) ^ (ps.PassedOnDrawing ? 1 : 0);
+                hash = (hash * 397) ^ (ps.SkipTurns > 0 ? 1 : 0);
+                hash = (hash * 397) ^ gc.UI.Sleeve.GetCards().Length;
+                return hash;
+            }
         }
 
         /// <summary>Log the current position and what the solver would do, without acting.</summary>
         private void DumpState(GameController gc, string source)
         {
-            SolverState sim = BuildSim(gc, gc.State.Player);
-            RoundSolver solver = MakeSolver(OptimalPlayPlugin.Cfg);
-            SolverMove move = solver.BestMove(sim, out float value, out int nodes, out bool aborted,
-                out List<MoveEvaluation> evaluations);
+            PollDump();
+            if (_dumpJob != null)
+            {
+                OptimalPlayPlugin.Log.LogInfo("State dump skipped: a previous dump is still running.");
+                return;
+            }
+
+            Settings cfg = OptimalPlayPlugin.Cfg;
+            _dumpState = BuildSim(gc, gc.State.Player);
+            SolverState state = _dumpState;
+            int nodes = Mathf.Max(1000, cfg.SearchNodeBudget.Value);
+            int timeMs = Mathf.Max(20, cfg.SearchTimeMs.Value);
+            _dumpJob = SolverWorker.Post(() => NativeSolver.Solve(state, nodes, timeMs));
+            OptimalPlayPlugin.Log.LogInfo($"{source}: searching in the background...");
+        }
+
+        private void PollDump()
+        {
+            if (_dumpJob == null || !_dumpJob.Done)
+            {
+                return;
+            }
+
+            SolverJob<SolveResult> job = _dumpJob;
+            _dumpJob = null;
+            SolverState sim = _dumpState;
+            _dumpState = null;
+
+            if (job.Error != null)
+            {
+                OptimalPlayPlugin.Log.LogError($"State dump failed: {job.Error.Message}");
+                return;
+            }
+
             var sb = new StringBuilder();
-            AppendReport(sb, source, sim, solver, move, value, nodes, aborted, evaluations);
+            AppendReport(sb, "dump", sim, job.Result);
             OptimalPlayPlugin.Log.LogInfo(sb.ToString());
         }
 
-        private static void AppendReport(StringBuilder sb, string source, SolverState sim, RoundSolver solver,
-            SolverMove move, float value, int nodes, bool aborted, List<MoveEvaluation> evaluations)
+        private static void AppendReport(StringBuilder sb, string source, SolverState sim, SolveResult result)
         {
             sb.Append("=== Optimal Play: ").Append(source).AppendLine(" ===");
             sb.Append("match: target ").Append(sim.PlainTarget)
                 .Append(", holds at ").Append(sim.HoldsAt)
                 .Append(", rules: ").Append(Rules(sim)).AppendLine();
-            AppendSide(sb, "player", sim, sim.P, sim.PValue, sim.PTarget);
-            AppendSide(sb, "opponent", sim, sim.O, sim.OValue, sim.OTarget);
+            AppendSide(sb, "player", sim, sim.P, result.PValue, result.PTarget);
+            AppendSide(sb, "opponent", sim, sim.O, result.OValue, result.OTarget);
             sb.AppendLine("moves:");
-            sb.Append(solver.DescribeMoves(sim, evaluations));
-            sb.Append("result: ").Append(RoundSolver.MoveLabel(move, sim));
-            if (!float.IsNaN(value))
+            sb.Append(SolverReport.DescribeMoves(sim, result));
+            sb.Append("result: ").Append(SolverReport.MoveLabel(result.Best, sim));
+            if (!float.IsNaN(result.Value))
             {
-                sb.Append(" | ev ").Append(value.ToString("+0.##;-0.##;0"));
+                sb.Append(" | ev ").Append(SolverReport.Format(result.Value));
             }
-            sb.Append(" | ").Append(nodes).Append(" nodes");
-            sb.Append(aborted ? " (budget reached, greedy fallback)" : " (complete)");
-            if (solver.Note != null)
+            sb.Append(" | ").Append(result.Nodes).Append(" nodes");
+            sb.Append(result.Aborted ? " (budget reached, greedy fallback)" : " (complete)");
+            if (result.ProgressTieBreak)
             {
-                sb.Append(" [").Append(solver.Note).Append(']');
+                sb.Append(" [").Append(SolverReport.ProgressNote).Append(']');
             }
             sb.AppendLine();
         }
@@ -316,7 +443,7 @@ namespace BlackJacket.OptimalPlay
             sb.AppendLine();
             sb.Append("  table: ").AppendLine(CardList(side.Table, int.MaxValue));
             sb.Append("  deck top: ").AppendLine(CardList(side.Deck, side.DeckPos, 6));
-            sb.Append("  discard: ").Append(side.Discard.Count).AppendLine(" cards");
+            sb.Append("  discard: ").Append(side.DiscardCount).AppendLine(" cards");
             sb.Append("  sleeve: ").AppendLine(CardList(side.Sleeve, int.MaxValue));
         }
 
@@ -374,7 +501,7 @@ namespace BlackJacket.OptimalPlay
                 HoldsAt = gc.CurrentMatch != null ? gc.CurrentMatch.OpponentHoldsAtXTableValue : 17,
                 InsightLeft = OpponentController.Instance != null ? OpponentController.Instance.DeckInsight : 0,
                 SleeveSize = GameController.Config.SleeveSize.ModifiedValue,
-                SleeveCosts = GameController.Config.DrawToSleeveCosts.ModifiedValue,
+                SleeveCosts = (int[])GameController.Config.DrawToSleeveCosts.ModifiedValue.Clone(),
                 Uprising = gc.CurrentMatch != null && gc.CurrentMatch.HasRule(GameRule.Uprising),
                 Supper = gc.CurrentMatch != null && gc.CurrentMatch.HasRule(GameRule.Supper),
             };
@@ -384,16 +511,16 @@ namespace BlackJacket.OptimalPlay
             bool potUsable = potValue <= 0 || ps.CoinManager.CanPay(stashValue + 1, true);
             sim.Payable = stashValue + (potUsable ? potValue : 0);
 
-            sim.P = BuildSide(ps.DrawPile.Cards, ps.DiscardPile.Cards, gc.UI.Sleeve.GetCards(),
+            sim.P = BuildSide(ps.DrawPile.Cards, ps.DiscardPile.Cards.Length, gc.UI.Sleeve.GetCards(),
                 ps.TableDropArea.Cards, ps.TableDropArea.FreeSlotCount, ps.Bet.CoinValue,
                 ps.DrawToSleeveCount, ps.PassedOnDrawing);
-            sim.O = BuildSide(os.DrawPile.Cards, os.DiscardPile.Cards, null,
+            sim.O = BuildSide(os.DrawPile.Cards, os.DiscardPile.Cards.Length, null,
                 os.TableDropArea.Cards, os.TableDropArea.FreeSlotCount, os.Bet.CoinValue,
                 0, os.PassedOnDrawing);
             return sim;
         }
 
-        private static SolverSide BuildSide(Card3D[] drawPile, Card3D[] discardPile, Card3D[] sleeve,
+        private static SolverSide BuildSide(Card3D[] drawPile, int discardCount, Card3D[] sleeve,
             Card3D[] table, int freeSlots, int bet, int sleeveDraws, bool passed)
         {
             var deck = new List<SolverCard>(drawPile.Length);
@@ -402,16 +529,10 @@ namespace BlackJacket.OptimalPlay
                 deck.Add(SolverCard.From(drawPile[i]));
             }
 
-            var discard = new List<SolverCard>(discardPile.Length);
-            foreach (Card3D card in discardPile)
-            {
-                discard.Add(SolverCard.From(card));
-            }
-
             var side = new SolverSide
             {
                 Deck = deck,
-                Discard = discard,
+                DiscardCount = discardCount,
                 DeckPos = 0,
                 Capacity = freeSlots,
                 Bet = bet,
@@ -465,7 +586,7 @@ namespace BlackJacket.OptimalPlay
                 {
                     if (!gc.PlayerCanDrawToSleeve())
                     {
-                        ExecuteFallback(gc, sim);
+                        PressPass(gc);
                         return;
                     }
                     if (!ui.Player.DrawPile.TryToDraw(out Card3D card))
@@ -505,20 +626,6 @@ namespace BlackJacket.OptimalPlay
                     return;
                 }
             }
-        }
-
-        private void ExecuteFallback(GameController gc, SolverState sim)
-        {
-            SolverState copy = sim.Clone();
-            copy.SleeveSize = 0;
-            copy.Payable = 0;
-            var solver = new RoundSolver();
-            SolverMove move = solver.BestMove(copy, out _, out _, out _, out _);
-            if (move.Kind == MoveKind.SleeveTop)
-            {
-                move = new SolverMove { Kind = MoveKind.Pass };
-            }
-            ExecuteMove(gc, copy, move);
         }
 
         private static bool DropToTable(Card3D card, bool toOpponent)

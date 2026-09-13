@@ -90,6 +90,10 @@ namespace BlackJacket.OptimalPlay
             return line;
         }
 
+        /// <summary>
+        /// Value-and-flag signature of a deck order, used to drop permutations the solver
+        /// cannot tell apart (identical cards in identical positions).
+        /// </summary>
         public static string OrderKey(List<SolverCard> order)
         {
             var sb = new StringBuilder(order.Count * 6);
@@ -99,7 +103,33 @@ namespace BlackJacket.OptimalPlay
                 {
                     sb.Append('|');
                 }
-                sb.Append(order[i].Sig);
+                SolverCard card = order[i];
+                sb.Append(card.IsAce ? 'a' : 'n');
+                if (card.IsHollow)
+                {
+                    sb.Append('h');
+                }
+                if (card.AlwaysInsight)
+                {
+                    sb.Append('i');
+                }
+                if (card.CanPlayOpponent)
+                {
+                    sb.Append('o');
+                }
+                if (card.Broken)
+                {
+                    sb.Append('b');
+                }
+                sb.Append(':');
+                for (int v = 0; v < card.Values.Length; v++)
+                {
+                    if (v > 0)
+                    {
+                        sb.Append('/');
+                    }
+                    sb.Append(card.Values[v]);
+                }
             }
             return sb.ToString();
         }

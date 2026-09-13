@@ -12,7 +12,7 @@ namespace BlackJacket.OptimalPlay
     {
         public const string PluginGuid = "com.blackjacket.mods.optimalplay";
         public const string PluginName = "Black Jacket - Optimal Play";
-        public const string PluginVersion = "1.3.0";
+        public const string PluginVersion = "2.0.0";
 
         internal static ManualLogSource Log;
         internal static Settings Cfg;
@@ -21,6 +21,16 @@ namespace BlackJacket.OptimalPlay
         {
             Log = Logger;
             Cfg = new Settings(Config);
+
+            NativeSolver.Initialize();
+            if (NativeSolver.Available)
+            {
+                Log.LogInfo("Native solver loaded.");
+            }
+            else
+            {
+                Log.LogError($"Native solver unavailable ({NativeSolver.LoadError}); automation is disabled.");
+            }
 
             var harmony = new Harmony(PluginGuid);
             try
@@ -163,11 +173,13 @@ namespace BlackJacket.OptimalPlay
             ToggleKey = file.Bind("General", "ToggleKey", new KeyboardShortcut(KeyCode.F8),
                 "Key that toggles AutoPlay at runtime.");
 
-            SearchNodeBudget = file.Bind("Solver", "SearchNodeBudget", 250000,
-                "Maximum number of search nodes per decision. Higher is stronger but slower.");
+            SearchNodeBudget = file.Bind("Solver", "SearchNodeBudget", 2000000,
+                "Maximum number of search nodes per decision. Searches stop early when solved, so this is a safety cap; "
+                + "the time budget binds first for hard positions.");
 
-            SearchTimeMs = file.Bind("Solver", "SearchTimeMs", 200,
-                "Maximum search time per decision, in milliseconds.");
+            SearchTimeMs = file.Bind("Solver", "SearchTimeMs", 1000,
+                "Maximum search time per decision, in milliseconds. Searches run on a background thread, "
+                + "so raising this does not freeze the game.");
         }
     }
 }
