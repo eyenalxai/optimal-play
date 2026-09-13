@@ -409,12 +409,28 @@ namespace BlackJacket.OptimalPlay
                 sb.Append(" | ev ").Append(SolverReport.Format(result.Value));
             }
             sb.Append(" | ").Append(result.Nodes).Append(" nodes");
-            sb.Append(result.Aborted ? " (budget reached, greedy fallback)" : " (complete)");
+            if (result.Partial)
+            {
+                sb.Append(" (budget reached: best completed move)");
+            }
+            else if (result.Aborted)
+            {
+                sb.Append(" (budget reached, greedy fallback)");
+            }
+            else
+            {
+                sb.Append(" (complete)");
+            }
             if (result.ProgressTieBreak)
             {
                 sb.Append(" [").Append(SolverReport.ProgressNote).Append(']');
             }
             sb.AppendLine();
+            if (result.Trace.Count > 0)
+            {
+                sb.AppendLine("expected line:");
+                sb.Append(SolverReport.DescribeTrace(result));
+            }
         }
 
         private static string Rules(SolverState sim)
@@ -438,12 +454,14 @@ namespace BlackJacket.OptimalPlay
                 .Append(", target ").Append(target)
                 .Append(", capacity ").Append(side.Capacity)
                 .Append(", passed ").Append(side.Passed ? "yes" : "no")
-                .Append(", bet ").Append(side.Bet);
+                .Append(", bet ").Append(side.Bet)
+                .Append(", stash ").Append(side.Stash);
             if (ReferenceEquals(side, sim.P))
             {
                 sb.Append(", sleeve draws ").Append(side.SleeveDraws).Append('/').Append(sim.SleeveSize)
                     .Append(", next sleeve cost ").Append(NextSleeveCost(sim, side))
-                    .Append(", payable ").Append(sim.Payable);
+                    .Append(", payable ").Append(sim.Payable)
+                    .Append(", pot ").Append(sim.Pot).Append(sim.PotUsable ? " (usable)" : " (locked)");
             }
             else
             {
@@ -481,6 +499,10 @@ namespace BlackJacket.OptimalPlay
             {
                 SolverCard card = cards[i];
                 string part = card.Label;
+                if (card.Effects.Count > 0)
+                {
+                    part += " ~" + card.Effects.Count;
+                }
                 if (card.Effect != null)
                 {
                     part += " (" + card.Effect + ")";
