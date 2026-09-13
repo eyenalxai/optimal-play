@@ -1108,14 +1108,16 @@ fn greedy_move(s: &State) -> Move {
 }
 
 /// Progress nudge: among the moves that tie the best (non-positive) value, prefer
-/// playing a card over passing so the position keeps moving. A dead top card cycles the
-/// deck; a dead sleeve card clears the sleeve. When the draw pile is already empty the
-/// round cannot be won by saving cards either, so any sleeve play that removes the card
-/// qualifies. A card that puts itself back into the sleeve is never chosen, since it
-/// would be played every turn.
+/// playing over passing so the position keeps moving. A dead top card cycles the deck;
+/// any top or sleeve play that advances the deck is next, so a lost round never freezes
+/// on a pass while cards remain. A dead sleeve card clears the sleeve, and when the draw
+/// pile is already empty any sleeve play that removes the card qualifies. A card that
+/// puts itself back into the sleeve is never chosen by this rule, since it would be
+/// played every turn.
 fn progress_move(root: &State, evaluations: &[Eval], best: f32) -> Move {
     const EPS: f32 = 0.0001;
     let deck_empty = root.p.top().is_none();
+    let mut progress = None;
     let mut dead: SmallVec<[Move; 8]> = SmallVec::new();
     let mut other: SmallVec<[Move; 8]> = SmallVec::new();
 
@@ -1125,10 +1127,18 @@ fn progress_move(root: &State, evaluations: &[Eval], best: f32) -> Move {
         }
         match eval.mv.kind {
             MoveKind::PlayTop => {
-                if let Some(top) = root.p.top()
-                    && top.is_dead()
-                {
-                    return eval.mv;
+                if let Some(top) = root.p.top() {
+                    if top.is_dead() {
+                        return eval.mv;
+                    }
+                    if progress.is_none() {
+                        progress = Some(eval.mv);
+                    }
+                }
+            }
+            MoveKind::SleeveTop => {
+                if progress.is_none() {
+                    progress = Some(eval.mv);
                 }
             }
             MoveKind::PlaySleeve => {
@@ -1147,6 +1157,9 @@ fn progress_move(root: &State, evaluations: &[Eval], best: f32) -> Move {
         }
     }
 
+    if let Some(mv) = progress {
+        return mv;
+    }
     for mv in dead.into_iter().chain(other) {
         if sleeve_play_removes_card(root, mv) {
             return mv;
