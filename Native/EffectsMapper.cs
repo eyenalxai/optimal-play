@@ -160,15 +160,17 @@ namespace BlackJacket.OptimalPlay
                         unmodeled.Add(effect == null ? "empty effect" : effect.GetType().Name);
                         continue;
                     }
-                    foreach (SolverEffect spec in specs)
+                    Assign(specs, trigger, flags, cond, condCmp, condA, condB, mapped);
+                    // An Angler Fish Trap also listens for a card being placed in its
+                    // opposite slot and runs its whole effect again. The opposite slot
+                    // lives on the other table.
+                    if (effect is AnglerFishTrap && trigger != TriggerCardPlayedToTable)
                     {
-                        spec.Trigger = trigger;
-                        spec.Flags = flags;
-                        spec.Cond = cond;
-                        spec.CondCmp = condCmp;
-                        spec.CondA = condA;
-                        spec.CondB = condB;
-                        mapped.Add(spec);
+                        List<SolverEffect> reaction = MapEffect(effect);
+                        if (reaction != null)
+                        {
+                            Assign(reaction, TriggerCardPlayedToTable, FlagReactOtherTable, 0, 0, 0, 0, mapped);
+                        }
                     }
                 }
             }
@@ -641,6 +643,22 @@ namespace BlackJacket.OptimalPlay
         private static List<SolverEffect> One(SolverEffect effect)
         {
             return new List<SolverEffect> { effect };
+        }
+
+        /// <summary>Copy container-level trigger, flags and conditions onto mapped specs.</summary>
+        private static void Assign(List<SolverEffect> specs, byte trigger, byte flags, byte cond,
+            byte condCmp, int condA, int condB, List<SolverEffect> target)
+        {
+            foreach (SolverEffect spec in specs)
+            {
+                spec.Trigger = trigger;
+                spec.Flags = flags;
+                spec.Cond = cond;
+                spec.CondCmp = condCmp;
+                spec.CondA = condA;
+                spec.CondB = condB;
+                target.Add(spec);
+            }
         }
 
         private static bool HasGatherLocation(UniversalCardTargetConfig universal, int location)

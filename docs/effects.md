@@ -79,7 +79,9 @@ space to remove:
 
 - **Table geometry.** The game picks the opponent's slot randomly, so exact positions
   are unrecoverable. Relative targets therefore use placement order, and the executor's
-  own drop is always the first free slot.
+  own drop is always the first free slot. Angler Fish Trap's "card placed opposite"
+  reaction consequently fires on any other-table placement rather than only a true
+  opposite-slot one.
 - **Temp modifiers.** The game replaces other temporary modifiers on a card when one is
   applied; the solver applies adjustments to the current values and clamps per the
   `` `Broken` `` type. `AddValue` on a positive value that would exceed the target is
