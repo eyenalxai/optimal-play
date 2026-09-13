@@ -12,7 +12,7 @@ namespace BlackJacket.OptimalPlay
     /// </summary>
     internal static class SolverProtocol
     {
-        internal const uint Version = 1;
+        internal const uint Version = 2;
 
         internal const uint FlagUprising = 1;
         internal const uint FlagSupper = 2;
@@ -22,6 +22,11 @@ namespace BlackJacket.OptimalPlay
         internal const uint CardAlwaysInsight = 1 << 2;
         internal const uint CardCanPlayOpponent = 1 << 3;
         internal const uint CardBroken = 1 << 4;
+
+        // `ModifiableValue.EType` bits; the native search keys value behavior off these.
+        internal const uint CardTypeTarget = 1;
+        internal const uint CardTypeDrain = 4;
+        internal const uint CardTypeBroken = 8;
 
         internal const uint OpSetDeckOrder = 1;
         internal const uint OpTakeDeckToSleeve = 2;
@@ -56,6 +61,8 @@ namespace BlackJacket.OptimalPlay
             w.I32(state.InsightLeft);
             w.I32(state.SleeveSize);
             w.I32(state.Payable);
+            w.I32(state.Pot);
+            w.U32(state.PotUsable ? 1u : 0u);
 
             int[] costs = state.SleeveCosts ?? Array.Empty<int>();
             w.U32(costs.Length);
@@ -73,6 +80,7 @@ namespace BlackJacket.OptimalPlay
             w.I32(side.DeckPos);
             w.I32(side.Capacity);
             w.I32(side.Bet);
+            w.I32(side.Stash);
             w.U32(side.SleeveDraws);
             w.U32(side.Passed ? 1u : 0u);
             // The game never tells us the opponent ran out of cards; the native search tracks
@@ -98,9 +106,11 @@ namespace BlackJacket.OptimalPlay
         {
             int[] values = card.Values ?? Array.Empty<int>();
             w.U32(values.Length);
-            foreach (int value in values)
+            for (int i = 0; i < values.Length; i++)
             {
-                w.I32(value);
+                w.I32(values[i]);
+                int type = card.Types != null && i < card.Types.Length ? card.Types[i] : (int)CardTypeTarget;
+                w.U32((uint)type);
             }
             uint flags = 0;
             if (card.IsAce)
@@ -124,7 +134,31 @@ namespace BlackJacket.OptimalPlay
                 flags |= CardBroken;
             }
             w.U32(flags);
+
+            List<SolverEffect> effects = card.Effects ?? EmptyEffects;
+            w.U32(effects.Count);
+            foreach (SolverEffect effect in effects)
+            {
+                w.U32(effect.Trigger);
+                w.U32(effect.Flags);
+                w.U32(effect.Op);
+                w.U32(effect.Target);
+                w.I32(effect.T1);
+                w.I32(effect.T2);
+                w.I32(effect.T3);
+                w.I32(effect.A);
+                w.I32(effect.B);
+                w.I32(effect.C);
+                w.I32(effect.D);
+                w.U32(effect.Filter);
+                w.U32(effect.Cond);
+                w.U32(effect.CondCmp);
+                w.I32(effect.CondA);
+                w.I32(effect.CondB);
+            }
         }
+
+        private static readonly List<SolverEffect> EmptyEffects = new List<SolverEffect>();
 
         /// <summary>Append `u32 candidate_count`; call between it and the candidates the batch writer helpers.</summary>
         internal static void WriteCandidateCount(SolverBuffer w, int count)

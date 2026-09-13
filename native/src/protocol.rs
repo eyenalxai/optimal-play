@@ -7,13 +7,18 @@
 //! Input (state):
 //! ```text
 //! u32 version; u32 flags (1 uprising, 2 supper)
-//! i32 plain_target, p_mods, o_mods, holds_at, insight_left, sleeve_size, payable
+//! i32 plain_target, p_mods, o_mods, holds_at, insight_left, sleeve_size, payable, pot
+//! u32 pot_usable (1 when sleeve costs may also draw on the winners pot)
 //! u32 cost_count; i32[cost_count] sleeve_costs
 //! side P, side O
 //! ```
-//! Side: `i32 deck_pos, capacity, bet; u32 sleeve_draws, passed, out_of_cards,
+//! Side: `i32 deck_pos, capacity, bet, stash; u32 sleeve_draws, passed, out_of_cards,
 //! discard_count;` then the deck, sleeve and table zones. A zone is `u32 len` followed
-//! by cards. A card is `u32 value_count; i32[value_count] values; u32 flags`.
+//! by cards. A card is `u32 value_count;` then per value `i32 value, u32 types`
+//! (`ModifiableValue.EType` bits), `u32 flags; u32 effect_count;` then the effect
+//! records. An effect is `u32 trigger, u32 flags, u32 op, u32 target, i32 t1, i32 t2,
+//! i32 t3, i32 a, i32 b, i32 c, i32 d, u32 filter, u32 cond, u32 cond_cmp, i32 cond_a,
+//! i32 cond_b`.
 //!
 //! Batch input appends `u32 candidate_count` and per candidate a length-framed op block:
 //! `u32 byte_len` followed by ops: `u32 kind; u32 side; i32 a; i32 b; u32 list_len;
@@ -21,10 +26,10 @@
 //! kind 2 = TakeDeckToSleeve (`a` = deck index), kind 3 = MoveTableToSleeve
 //! (`a` = table index).
 
-use crate::model::{Card, MAX_VALUES, Side, State};
-use crate::solver::{MoveKind, Note, Outcome, SleeveReason};
+use crate::model::{Card, Effect, EffectBlock, MAX_EFFECTS, MAX_VALUES, Side, State};
+use crate::solver::{MoveKind, Note, Outcome, SleeveReason, TraceStep};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 pub const ERR_VERSION: i32 = -1;
 pub const ERR_TRUNCATED: i32 = -2;
@@ -99,6 +104,8 @@ pub fn parse_state(r: &mut Reader) -> Result<State, i32> {
     let insight_left = r.i32()?;
     let sleeve_size = r.i32()?;
     let payable = r.i32()?;
+    let pot = r.i32()?;
+    let pot_usable = r.u32()? != 0;
 
     let cost_count = r.u32()? as usize;
     if cost_count > MAX_ZONE {
@@ -109,8 +116,9 @@ pub fn parse_state(r: &mut Reader) -> Result<State, i32> {
         sleeve_costs.push(r.i32()?);
     }
 
-    let p = parse_side(r)?;
-    let o = parse_side(r)?;
+    let mut interner = EffectInterner::default();
+    let p = parse_side(r, &mut interner)?;
+    let o = parse_side(r, &mut interner)?;
 
     let mut state = State::new();
     state.plain_target = plain_target;
@@ -120,7 +128,10 @@ pub fn parse_state(r: &mut Reader) -> Result<State, i32> {
     state.insight_left = insight_left;
     state.sleeve_size = sleeve_size;
     state.payable = payable;
-    state.sleeve_costs = sleeve_costs;
+    state.pot = pot;
+    state.pot_usable = pot_usable;
+    state.sleeve_costs = sleeve_costs.into();
+    state.effect_blocks = interner.blocks.into();
     state.uprising = flags & 1 != 0;
     state.supper = flags & 2 != 0;
     state.p = p;
@@ -128,50 +139,123 @@ pub fn parse_state(r: &mut Reader) -> Result<State, i32> {
     Ok(state)
 }
 
-fn parse_side(r: &mut Reader) -> Result<Side, i32> {
+/// Interns effect lists while a state is parsed: equal lists share one block and cards
+/// only store the block index, which keeps [`Card`] small enough to copy cheaply.
+#[derive(Default)]
+struct EffectInterner {
+    map: std::collections::HashMap<Vec<Effect>, u32>,
+    blocks: Vec<EffectBlock>,
+}
+
+impl EffectInterner {
+    fn intern(&mut self, effects: &[Effect]) -> u32 {
+        if effects.is_empty() {
+            return 0;
+        }
+        if let Some(&index) = self.map.get(effects) {
+            return index + 1;
+        }
+        let mut block = EffectBlock {
+            count: effects.len() as u8,
+            ..Default::default()
+        };
+        block.effects[..effects.len()].copy_from_slice(effects);
+        let index = self.blocks.len() as u32;
+        self.blocks.push(block);
+        self.map.insert(effects.to_vec(), index);
+        index + 1
+    }
+}
+
+fn parse_side(r: &mut Reader, interner: &mut EffectInterner) -> Result<Side, i32> {
     let mut side = Side::new();
     side.deck_pos = r.i32()?.max(0) as u32;
     side.capacity = r.i32()?;
     side.bet = r.i32()?;
+    side.stash = r.i32()?;
     side.sleeve_draws = r.u32()?;
     side.passed = r.u32()? != 0;
     side.out_of_cards = r.u32()? != 0;
     side.discard_count = r.u32()?;
-    side.deck = parse_zone(r)?.into();
-    side.sleeve = parse_zone(r)?.into_iter().collect();
-    side.table = parse_zone(r)?.into_iter().collect();
+    side.deck = parse_zone(r, interner)?.into();
+    side.sleeve = parse_zone(r, interner)?.into_iter().collect();
+    side.table = parse_zone(r, interner)?.into_iter().collect();
     Ok(side)
 }
 
-fn parse_zone(r: &mut Reader) -> Result<Vec<Card>, i32> {
+fn parse_zone(r: &mut Reader, interner: &mut EffectInterner) -> Result<Vec<Card>, i32> {
     let len = r.u32()? as usize;
     if len > MAX_ZONE {
         return Err(ERR_TRUNCATED);
     }
     let mut cards = Vec::with_capacity(len);
     for _ in 0..len {
-        cards.push(parse_card(r)?);
+        cards.push(parse_card(r, interner)?);
     }
     Ok(cards)
 }
 
-fn parse_card(r: &mut Reader) -> Result<Card, i32> {
+fn parse_card(r: &mut Reader, interner: &mut EffectInterner) -> Result<Card, i32> {
     let count = r.u32()? as usize;
     if count == 0 || count > MAX_VALUES {
         return Err(ERR_CARD);
     }
-    let mut values = [0i32; MAX_VALUES];
-    for value in values.iter_mut().take(count) {
-        *value = r.i32()?;
+    let mut card = Card::new(&vec![0; count], 0);
+    for index in 0..count {
+        card.values[index] = r.i32()?;
+        let types = r.u32()?;
+        if types > u8::MAX as u32 {
+            return Err(ERR_CARD);
+        }
+        card.types[index] = types as u8;
     }
     let flags = r.u32()?;
     if flags > u8::MAX as u32 {
         return Err(ERR_CARD);
     }
-    Ok(Card {
-        values,
-        value_count: count as u8,
+    card.flags = flags as u8;
+
+    let effect_count = r.u32()? as usize;
+    if effect_count > MAX_EFFECTS {
+        return Err(ERR_CARD);
+    }
+    let mut effects = [Effect::default(); MAX_EFFECTS];
+    for slot in effects.iter_mut().take(effect_count) {
+        *slot = parse_effect(r)?;
+    }
+    card.effects_ref = interner.intern(&effects[..effect_count]);
+    Ok(card)
+}
+
+fn parse_effect(r: &mut Reader) -> Result<Effect, i32> {
+    let trigger = r.u32()?;
+    let flags = r.u32()?;
+    let op = r.u32()?;
+    let target = r.u32()?;
+    if trigger > u8::MAX as u32
+        || flags > u8::MAX as u32
+        || op > u8::MAX as u32
+        || target > u8::MAX as u32
+    {
+        return Err(ERR_CARD);
+    }
+    Ok(Effect {
+        trigger: trigger as u8,
         flags: flags as u8,
+        op: op as u8,
+        target: target as u8,
+        t1: r.i32()?,
+        t2: r.i32()?,
+        t3: r.i32()?,
+        a: r.i32()?,
+        b: r.i32()?,
+        c: r.i32()?,
+        d: r.i32()?,
+        filter: r.u32()?,
+        cond: r.u32()? as u8,
+        cond_cmp: r.u32()? as u8,
+        cond_a: r.i32()?,
+        cond_b: r.i32()?,
     })
 }
 
@@ -362,6 +446,7 @@ pub fn write_solve_result(out: &mut Writer, outcome: &Outcome) {
     out.u64(outcome.nodes);
     out.u32(outcome.aborted as u32);
     out.u32(note_code(outcome.note));
+    out.u32(outcome.partial as u32);
     out.i32(outcome.p_value);
     out.i32(outcome.o_value);
     out.i32(outcome.p_target);
@@ -396,7 +481,73 @@ pub fn write_solve_result(out: &mut Writer, outcome: &Outcome) {
         out.u32(mv.to_opponent as u32);
     }
     for eval in &outcome.evaluations {
+        out.u32(eval.index as u32);
         out.f64(eval.value as f64);
+    }
+
+    out.u32(outcome.trace.len() as u32);
+    for step in &outcome.trace {
+        match step {
+            TraceStep::Player { mv, card } => {
+                out.u32(0);
+                out.i32(move_kind_code(mv.kind));
+                out.i32(mv.sleeve_index);
+                out.u32(mv.to_opponent as u32);
+                write_trace_card(out, *card);
+                out.i32(0);
+                out.i32(0);
+                out.i32(0);
+            }
+            TraceStep::OpponentDraw { card } => {
+                out.u32(1);
+                out.i32(0);
+                out.i32(0);
+                out.u32(0);
+                write_trace_card(out, Some(*card));
+                out.i32(0);
+                out.i32(0);
+                out.i32(0);
+            }
+            TraceStep::OpponentPass => {
+                out.u32(2);
+                out.i32(0);
+                out.i32(0);
+                out.u32(0);
+                write_trace_card(out, None);
+                out.i32(0);
+                out.i32(0);
+                out.i32(0);
+            }
+            TraceStep::Resolve {
+                winner,
+                p_value,
+                o_value,
+            } => {
+                out.u32(3);
+                out.i32(0);
+                out.i32(0);
+                out.u32(0);
+                write_trace_card(out, None);
+                out.i32(*p_value);
+                out.i32(*o_value);
+                out.i32(*winner);
+            }
+        }
+    }
+}
+
+fn write_trace_card(out: &mut Writer, card: Option<Card>) {
+    match card {
+        Some(card) => {
+            out.u32(1);
+            out.u32(card.value_count as u32);
+            for index in 0..card.value_count as usize {
+                out.i32(card.values[index]);
+                out.u32(card.types[index] as u32);
+            }
+            out.u32(card.flags as u32);
+        }
+        None => out.u32(0),
     }
 }
 

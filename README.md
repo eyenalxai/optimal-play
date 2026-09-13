@@ -35,7 +35,11 @@ wins the round. It also understands blackjack (two-card 21), busts, the single-c
 tiebreak, the `Uprising` target reduction and the `Supper` pass restriction.
 
 The game is re-read and re-solved on every one of your turns, so card effects that change
-values on the fly are picked up as soon as they happen.
+values on the fly are picked up as soon as they happen. The search also applies the card
+effects themselves: reactions, breaks and mends, drains, movement, duplication, coin
+effects and more are part of the game tree, not just the current values. See
+[docs/effects.md](docs/effects.md) for exactly which effects are modeled, which are not
+(they are logged by name) and the documented approximations.
 
 ## Automated selections
 
@@ -86,9 +90,21 @@ Decision: play top card Hearts_7_Upgraded[-7] | P 0 vs O 5 | ev -2 | 632 nodes |
 ```
 
 The `options:` list is every root move with what it is worth (in coins, same scale as the
-round result above). Cards are printed as `Name[values]`. `(budget reached, greedy fallback)`
-means the search ran out of time/nodes and the quick heuristic had to answer. Selection
-dialogs log one line each, e.g.:
+round result above). Cards are printed as `Name[values]`. `(budget reached: best completed
+move)` means the search ran out of time/nodes before evaluating every root move; the
+chosen move is the best one it fully completed. `(budget reached, greedy fallback)` means
+it could not complete even one and used the quick heuristic. When effects are modeled the
+log adds the expected line of play:
+
+```
+Expected line:
+  you play top [5] to opponent
+  opponent draws [10]
+  opponent passes
+  resolve: loss (18 vs 24)
+```
+
+Selection dialogs log one line each, e.g.:
 
 ```
 Card choice: sleeving Hearts_1_Upgraded[-1] (value +2; options: Hearts_1_Upgraded[-1]=+2, Copper_5[5]=-2).
@@ -162,11 +178,10 @@ leaves all input manual.
 
 - The opponent's reshuffles (and yours) use a random order. The search stops at the
   shuffle and re-plans with the real order on the next turn.
-- Card effects are only modeled through the values they have already applied; anything a
-  played card does that is not reflected in the current values is re-evaluated on the
-  next turn. In particular, awakened Hearts ("Break the opposing card.", "Mend each
-  surrounding card.", "Exploit N.") are scored by their negative value only - the bot does
-  not yet plan around their effects or slot positions.
+- Card effects are modeled as far as `docs/effects.md` describes. Effects outside that
+  list (shuffles, transforms, random choices, discard-pile picks, duo/trio events, ...)
+  are skipped and each distinct one is logged once as `Unmodeled card effect: <name>`.
+  The affected card is then scored as if the missing effect did nothing.
 - Sleeving a card does not model triggers such as *"When you sleeve a card ..."* perks; the
   sleeve contents, their order and the sleeve costs are modeled exactly.
 - Insight windows with more than four revealed cards only permute the top four; the rest

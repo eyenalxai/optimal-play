@@ -13,8 +13,15 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::time::Instant;
 
-use crate::model::{Card, FLAG_BROKEN, State};
+use smallvec::SmallVec;
+
+use crate::model::{Card, State, TRIGGER_RESOLUTION_AFTER, TRIGGER_RESOLUTION_BEFORE};
 use crate::total::{highest, total};
+use crate::{effects, model};
+
+/// A round's root has at most a few dozen moves (sleeve cards, both tables, pass), so the
+/// move list never touches the heap in practice.
+type MoveList = SmallVec<[(Move, State); 16]>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MoveKind {
@@ -67,6 +74,8 @@ impl Move {
 
 #[derive(Clone, Copy)]
 pub struct Eval {
+    /// Index into [`Outcome::legal`]; evaluations are not necessarily a prefix any more.
+    pub index: usize,
     pub mv: Move,
     pub value: f32,
 }
@@ -86,6 +95,24 @@ pub enum SleeveReason {
     DrawPileEmpty,
     CannotPay,
     Unavailable,
+}
+
+/// One action of the expected line of play behind the chosen move.
+#[derive(Clone, Copy)]
+pub enum TraceStep {
+    Player {
+        mv: Move,
+        card: Option<Card>,
+    },
+    OpponentDraw {
+        card: Card,
+    },
+    OpponentPass,
+    Resolve {
+        winner: i32,
+        p_value: i32,
+        o_value: i32,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -110,10 +137,15 @@ pub struct Outcome {
     pub value: f32,
     pub nodes: u64,
     pub aborted: bool,
-    /// One entry per evaluated root move, in move order; truncated on abort.
+    /// True when the search ran out of budget before evaluating every root move; `best`
+    /// and `value` are then the best *completed* root move instead of a greedy guess.
+    pub partial: bool,
+    /// One entry per evaluated root move (canonical order); incomplete on abort.
     pub evaluations: Vec<Eval>,
-    /// Legal root moves in move order (the evaluation list is its value prefix).
+    /// Legal root moves in canonical order.
     pub legal: Vec<Move>,
+    /// Expected line of play after `best`, when the search completed its root moves.
+    pub trace: Vec<TraceStep>,
     pub note: Note,
     pub p_value: i32,
     pub o_value: i32,
@@ -183,6 +215,33 @@ impl Hasher for U128Hasher {
 
 type MemoMap = HashMap<u128, f32, BuildHasherDefault<U128Hasher>>;
 
+/// Chosen move per player-decision position, packed for the principal-variation replay.
+type ChoiceMap = HashMap<u128, u32, BuildHasherDefault<U128Hasher>>;
+
+fn pack_move(mv: Move) -> u32 {
+    let kind = match mv.kind {
+        MoveKind::Pass => 0,
+        MoveKind::PlayTop => 1,
+        MoveKind::SleeveTop => 2,
+        MoveKind::PlaySleeve => 3,
+    };
+    kind | ((mv.sleeve_index.max(0) as u32 & 0x3F) << 2) | (u32::from(mv.to_opponent) << 8)
+}
+
+fn unpack_move(packed: u32) -> Move {
+    let kind = match packed & 3 {
+        1 => MoveKind::PlayTop,
+        2 => MoveKind::SleeveTop,
+        3 => MoveKind::PlaySleeve,
+        _ => MoveKind::Pass,
+    };
+    Move {
+        kind,
+        sleeve_index: ((packed >> 2) & 0x3F) as i32,
+        to_opponent: packed & (1 << 8) != 0,
+    }
+}
+
 /// Memo key of a position in a given game phase. Only the fields that can differ
 /// between two positions reached in the same search are part of it: the round
 /// constants (targets, rules, sleeve costs) and the discard contents never change
@@ -190,20 +249,33 @@ type MemoMap = HashMap<u128, f32, BuildHasherDefault<U128Hasher>>;
 fn memo_key(phase: u8, s: &State) -> u128 {
     let mut h = Hash128::new();
     h.mix(phase as u64);
-    hash_side(&mut h, &s.p);
-    hash_side(&mut h, &s.o);
+    // Effect-free positions never change a deck's order, so the deck contents are fixed
+    // for the whole search and hashing the position is enough. With effects in play a
+    // card can be moved into or out of a deck, so the untouched tail must key the state.
+    let full_deck = !s.effect_blocks.is_empty();
+    hash_side(&mut h, &s.p, full_deck);
+    hash_side(&mut h, &s.o, full_deck);
     h.mix(s.insight_left as u64);
     h.mix(s.payable as u64);
+    h.mix(s.pot as u64);
     h.finish()
 }
 
-fn hash_side(h: &mut Hash128, side: &crate::model::Side) {
+fn hash_side(h: &mut Hash128, side: &crate::model::Side, full_deck: bool) {
     h.mix(side.deck_pos as u64);
+    if full_deck {
+        let tail = &side.deck[(side.deck_pos as usize).min(side.deck.len())..];
+        h.mix(tail.len() as u64);
+        for card in tail {
+            hash_card(h, card);
+        }
+    }
     h.mix(side.passed as u64);
     h.mix(side.out_of_cards as u64);
     h.mix(side.capacity as u64);
     h.mix(side.sleeve_draws as u64);
     h.mix(side.bet as u64);
+    h.mix(side.stash as u64);
     h.mix(side.sleeve.len() as u64);
     for card in &side.sleeve {
         hash_card(h, card);
@@ -218,20 +290,39 @@ fn hash_side(h: &mut Hash128, side: &crate::model::Side) {
 }
 
 fn hash_card(h: &mut Hash128, card: &Card) {
-    h.mix(card.value_count as u64);
-    for &value in card.values() {
-        h.mix(value as u64);
+    let count = card.value_count as usize;
+    h.mix(count as u64);
+    // Two values per mix; the low half of the final odd value is zero-extended, so equal
+    // packs imply equal values and the sign survives in the two's complement bits.
+    let values = &card.values[..count];
+    let mut index = 0;
+    while index + 1 < count {
+        let low = values[index] as u32 as u64;
+        let high = values[index + 1] as u32 as u64;
+        h.mix(low | (high << 32));
+        index += 2;
     }
-    // The "broken" flag is derived from the values, so hash the derivation rather than
-    // trusting the transport bit (the managed Sig does the same).
-    h.mix((card.flags & !FLAG_BROKEN) as u64);
-    h.mix(card.values().iter().any(|&value| value < 0) as u64);
+    if index < count {
+        h.mix(values[index] as u32 as u64);
+    }
+    // All value types fit in one word (at most eight bytes).
+    let mut types = 0u64;
+    for (shift, &value_type) in card.types[..count].iter().enumerate() {
+        types |= (value_type as u64) << (shift * 8);
+    }
+    h.mix(types);
+    // Broken-ness is carried by the value types; the legacy flag bit is derived state.
+    h.mix((card.flags & !model::FLAG_BROKEN) as u64);
+    // Effect blocks are interned per state, so the reference identifies the whole list;
+    // two cards with equal values but different effects must hash differently.
+    h.mix(card.effects_ref as u64);
 }
 
 struct Solver {
     node_budget: u64,
     time_budget_ms: u64,
     memo: MemoMap,
+    choices: ChoiceMap,
     nodes: u64,
     aborted: bool,
     start: Instant,
@@ -239,7 +330,12 @@ struct Solver {
 
 /// Search the round and return the best root move plus its evaluation.
 pub fn solve(root: &State, budget: Budget) -> Outcome {
-    Solver::new(budget).best_move(root)
+    let mut solver = Solver::new(budget);
+    let mut outcome = solver.best_move(root);
+    if !outcome.aborted || outcome.partial {
+        outcome.trace = build_trace(root, outcome.best, &solver.choices);
+    }
+    outcome
 }
 
 /// Score a position exactly as the game loop after the player's action would play out.
@@ -255,6 +351,7 @@ impl Solver {
             node_budget: budget.nodes,
             time_budget_ms: budget.time_ms,
             memo: MemoMap::default(),
+            choices: ChoiceMap::default(),
             nodes: 0,
             aborted: false,
             start: Instant::now(),
@@ -262,39 +359,67 @@ impl Solver {
     }
 
     fn best_move(&mut self, root: &State) -> Outcome {
-        let mut best = Move::pass();
-        let mut best_value = f32::NEG_INFINITY;
-        let mut evaluations = Vec::new();
-        let mut legal = Vec::new();
+        let moves = enumerate_moves(root);
+        let legal: Vec<Move> = moves.iter().map(|(mv, _)| *mv).collect();
+        let mut values: Vec<Option<f32>> = vec![None; moves.len()];
+        let mut best_index: Option<usize> = None;
 
-        for (mv, state) in enumerate_moves(root) {
-            legal.push(mv);
+        // Evaluate root moves in preference order so that a budget abort has already
+        // covered the plausible candidates; ties still resolve to the earliest canonical
+        // move, so a complete search reports exactly the move a canonical scan would.
+        for index in preference_order(root, &moves) {
+            let (mv, state) = &moves[index];
             let value = if mv.kind == MoveKind::SleeveTop {
-                self.best_player(&state)
+                self.best_player(state)
             } else {
-                self.after_player_action(state)
+                self.after_player_action(state.clone())
             };
-            evaluations.push(Eval { mv, value });
-            if value > best_value {
-                best_value = value;
-                best = mv;
-            }
             if self.aborted {
+                // The value is a horizon estimate, not a finished search; do not trust it.
                 break;
             }
+            values[index] = Some(value);
+            best_index = match best_index {
+                None => Some(index),
+                Some(current) => {
+                    let current_value = values[current].expect("completed moves are stored");
+                    if value > current_value || (value == current_value && index < current) {
+                        Some(index)
+                    } else {
+                        Some(current)
+                    }
+                }
+            };
         }
 
-        let mut value = best_value;
+        let evaluations: Vec<Eval> = (0..moves.len())
+            .filter_map(|index| {
+                values[index].map(|value| Eval {
+                    index,
+                    mv: legal[index],
+                    value,
+                })
+            })
+            .collect();
+
         let mut note = Note::None;
-        if self.aborted || evaluations.is_empty() {
-            // Out of budget: answer with the cheap heuristic instead of a half search.
-            // Use the same NaN bits as .NET's float.NaN so bit-level comparisons hold.
-            best = greedy_move(root);
-            value = f32::from_bits(0xFFC0_0000);
-        } else if best.kind == MoveKind::Pass && best_value <= 0.0001 {
+        let partial = self.aborted && best_index.is_some();
+        let (mut best, value) = match best_index {
+            Some(index) => (
+                legal[index],
+                values[index].expect("completed moves are stored"),
+            ),
+            None => {
+                // No legal move at all, or the budget ran out before one finished: answer
+                // with the cheap heuristic. Use the same NaN bits as .NET's float.NaN.
+                (greedy_move(root), f32::from_bits(0xFFC0_0000))
+            }
+        };
+
+        if best_index.is_some() && best.kind == MoveKind::Pass && value <= 0.0001 {
             // Losing a round costs the bet no matter how it is lost; cycle a dead card
             // instead of passing and freezing the deck on it forever.
-            let progress = progress_move(root, &evaluations, best_value);
+            let progress = progress_move(root, &evaluations, value);
             if progress.kind != MoveKind::Pass {
                 best = progress;
                 note = Note::ProgressTieBreak;
@@ -307,6 +432,7 @@ impl Solver {
             value,
             nodes: self.nodes,
             aborted: self.aborted,
+            partial,
             evaluations,
             legal,
             note,
@@ -327,6 +453,7 @@ impl Solver {
                 .map(|top| top.can_play_opponent())
                 .unwrap_or(false)
                 && root.o.capacity <= 0,
+            trace: Vec::new(),
         }
     }
 
@@ -341,6 +468,7 @@ impl Solver {
         }
 
         let mut best = f32::NEG_INFINITY;
+        let mut best_move = None;
         for (mv, child) in enumerate_moves(s) {
             let value = if mv.kind == MoveKind::SleeveTop {
                 self.best_player(&child)
@@ -349,14 +477,18 @@ impl Solver {
             };
             if value > best {
                 best = value;
+                best_move = Some(mv);
             }
             if self.aborted {
                 return resolve(s);
             }
         }
-        if best == f32::NEG_INFINITY {
-            best = resolve(s);
-        }
+        match best_move {
+            Some(mv) => {
+                self.choices.insert(key, pack_move(mv));
+            }
+            None => best = resolve(s),
+        };
         self.memo.insert(key, best);
         best
     }
@@ -439,7 +571,7 @@ impl Solver {
             self.aborted = true;
             return true;
         }
-        if self.nodes & 1023 == 0 && self.start.elapsed().as_millis() as u64 > self.time_budget_ms {
+        if self.nodes & 4095 == 0 && self.start.elapsed().as_millis() as u64 > self.time_budget_ms {
             self.aborted = true;
             return true;
         }
@@ -450,85 +582,140 @@ impl Solver {
 // ---------------------------------------------------------------- rules
 
 /// Every legal root move with the state it leads to, in the order the plugin lists them.
-fn enumerate_moves(s: &State) -> Vec<(Move, State)> {
-    let mut moves = Vec::new();
+///
+/// Play semantics live in [`apply_player_move`] only; this is their enumeration.
+fn enumerate_moves(s: &State) -> MoveList {
+    let mut moves = MoveList::new();
+    for mv in candidate_moves(s) {
+        let (child, _) = apply_player_move(s, mv).expect("candidate_moves only lists legal moves");
+        moves.push((mv, child));
+    }
+    moves
+}
+
+/// Legal player moves in the canonical order the plugin reports them.
+fn candidate_moves(s: &State) -> SmallVec<[Move; 16]> {
+    let mut moves = SmallVec::new();
 
     if can_pass(s) {
-        let mut n = s.clone();
-        n.p.passed = true;
-        moves.push((Move::pass(), n));
+        moves.push(Move::pass());
     }
 
     let top = s.p.top().copied();
     if let Some(top) = top {
         if s.p.capacity > 0 {
-            let mut n = s.clone();
-            n.p.deck_pos += 1;
-            n.p.table.push(top);
-            n.p.capacity -= 1;
-            if top.is_hollow() {
-                n.p.capacity += 1;
-            }
-            n.invalidate_values();
-            moves.push((Move::play_top(false), n));
+            moves.push(Move::play_top(false));
         }
         if top.can_play_opponent() && s.o.capacity > 0 {
-            let mut n = s.clone();
-            n.p.deck_pos += 1;
-            n.o.table.push(top);
-            n.o.capacity -= 1;
-            if top.is_hollow() {
-                n.o.capacity += 1;
-            }
-            n.invalidate_values();
-            moves.push((Move::play_top(true), n));
+            moves.push(Move::play_top(true));
         }
     }
 
     if s.p.capacity > 0 || s.o.capacity > 0 {
         for (index, card) in s.p.sleeve.iter().enumerate() {
             if s.p.capacity > 0 {
-                let mut n = s.clone();
-                n.p.sleeve.remove(index);
-                n.p.table.push(*card);
-                n.p.capacity -= 1;
-                if card.is_hollow() {
-                    n.p.capacity += 1;
-                }
-                n.invalidate_values();
-                moves.push((Move::play_sleeve(index, false), n));
+                moves.push(Move::play_sleeve(index, false));
             }
             if card.can_play_opponent() && s.o.capacity > 0 {
-                let mut n = s.clone();
-                n.p.sleeve.remove(index);
-                n.o.table.push(*card);
-                n.o.capacity -= 1;
-                if card.is_hollow() {
-                    n.o.capacity += 1;
-                }
-                n.invalidate_values();
-                moves.push((Move::play_sleeve(index, true), n));
+                moves.push(Move::play_sleeve(index, true));
             }
         }
     }
 
     if can_sleeve(s) {
-        let top = *s.p.top().expect("can_sleeve checked the draw pile");
-        let cost = s.sleeve_cost();
-        let mut n = s.clone();
-        n.p.deck_pos += 1;
-        let max = s.sleeve_size.max(1) as usize;
-        if n.p.sleeve.len() >= max {
-            n.p.sleeve.remove(0);
-        }
-        n.p.sleeve.push(top);
-        n.p.sleeve_draws += 1;
-        n.p.bet += cost;
-        n.payable -= cost;
-        moves.push((Move::sleeve_top(), n));
+        moves.push(Move::sleeve_top());
     }
 
     moves
+}
+
+/// Apply one legal player move, returning the new state and the card it acted on (if any).
+/// This is the single place where playing, sleeving and passing change the state.
+fn apply_player_move(s: &State, mv: Move) -> Option<(State, Option<Card>)> {
+    match mv.kind {
+        MoveKind::Pass => {
+            let mut n = s.clone();
+            n.p.passed = true;
+            Some((n, None))
+        }
+        MoveKind::PlayTop => {
+            let top = *s.p.top()?;
+            let mut n = s.clone();
+            n.p.deck_pos += 1;
+            if mv.to_opponent {
+                n.o.table.push(top);
+                n.o.capacity -= 1;
+                if top.is_hollow() {
+                    n.o.capacity += 1;
+                }
+            } else {
+                n.p.table.push(top);
+                n.p.capacity -= 1;
+                if top.is_hollow() {
+                    n.p.capacity += 1;
+                }
+            }
+            n.invalidate_values();
+            effects::apply_play(&mut n, usize::from(mv.to_opponent));
+            Some((n, Some(top)))
+        }
+        MoveKind::PlaySleeve => {
+            let index = mv.sleeve_index.max(0) as usize;
+            let card = *s.p.sleeve.get(index)?;
+            let mut n = s.clone();
+            n.p.sleeve.remove(index);
+            if mv.to_opponent {
+                n.o.table.push(card);
+                n.o.capacity -= 1;
+                if card.is_hollow() {
+                    n.o.capacity += 1;
+                }
+            } else {
+                n.p.table.push(card);
+                n.p.capacity -= 1;
+                if card.is_hollow() {
+                    n.p.capacity += 1;
+                }
+            }
+            n.invalidate_values();
+            effects::apply_play(&mut n, usize::from(mv.to_opponent));
+            Some((n, Some(card)))
+        }
+        MoveKind::SleeveTop => {
+            if !can_sleeve(s) {
+                return None;
+            }
+            let top = *s.p.top()?;
+            let cost = s.sleeve_cost();
+            let mut n = s.clone();
+            n.p.deck_pos += 1;
+            let max = s.sleeve_size.max(1) as usize;
+            if n.p.sleeve.len() >= max {
+                n.p.sleeve.remove(0);
+            }
+            n.p.sleeve.push(top);
+            n.p.sleeve_draws += 1;
+            n.p.bet += cost;
+            n.payable -= cost;
+            Some((n, Some(top)))
+        }
+    }
+}
+
+/// Search root moves in decreasing order of promise, so a budget abort has already looked
+/// at the heuristic's first choice and the most natural alternatives. The sort is stable,
+/// so everything else keeps the canonical order used for tie-breaking.
+fn preference_order(root: &State, moves: &MoveList) -> Vec<usize> {
+    let greedy = greedy_move(root);
+    let mut order: Vec<usize> = (0..moves.len()).collect();
+    order.sort_by_key(|&index| {
+        let mv = moves[index].0;
+        let is_greedy = mv.kind == greedy.kind
+            && mv.sleeve_index == greedy.sleeve_index
+            && mv.to_opponent == greedy.to_opponent;
+        u8::from(!is_greedy)
+    });
+    order
 }
 
 fn can_pass(s: &State) -> bool {
@@ -563,18 +750,28 @@ fn sleeve_reason(s: &State, can_sleeve: bool) -> SleeveReason {
 
 // ---------------------------------------------------------------- opponent policy
 
-fn opponent_act(s: &mut State) {
+/// What the deterministic opponent policy did on its turn; the principal-variation replay
+/// records it, the search ignores it. `Card` is a plain value type and the enum only lives
+/// in the trace, so the variants stay inline instead of allocating.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Copy)]
+enum OpponentAction {
+    Draw(Card),
+    Pass,
+}
+
+fn opponent_act(s: &mut State) -> OpponentAction {
     if s.o.top().is_none() {
         // The game would reshuffle the discard pile; the new order is random, so the
         // deterministic search stops here and treats the opponent as standing.
         s.o.out_of_cards = true;
         s.o.passed = true;
-        return;
+        return OpponentAction::Pass;
     }
 
     if !opp_will_draw(s) {
         s.o.passed = true;
-        return;
+        return OpponentAction::Pass;
     }
 
     let card = *s.o.top().expect("checked above");
@@ -585,7 +782,9 @@ fn opponent_act(s: &mut State) {
         s.o.capacity += 1;
     }
     s.invalidate_values();
+    effects::apply_play(s, 1);
     s.insight_left = (s.insight_left - 1).max(0);
+    OpponentAction::Draw(card)
 }
 
 fn opp_will_draw(s: &State) -> bool {
@@ -636,7 +835,7 @@ fn opponent_unpass_check(s: &mut State) {
 // The branches mirror the game's settle order one to one; adjacent branches set the
 // same winner for different reasons on purpose.
 #[allow(clippy::if_same_then_else)]
-fn resolve(s: &State) -> f32 {
+fn winner(s: &State) -> i32 {
     let mut winner = 0i32;
     let p_bj = s.p_bj();
     let o_bj = s.o_bj();
@@ -670,16 +869,127 @@ fn resolve(s: &State) -> f32 {
             }
         }
     }
+    winner
+}
 
-    if winner > 0 {
-        s.o.bet as f32
-    } else if winner < 0 {
-        // Negate the integer first: a zero bet must produce +0.0, not -0.0, to match
-        // the managed solver's float bits exactly.
-        (-s.p.bet) as f32
-    } else {
-        0.0
+fn resolve(s: &State) -> f32 {
+    match settled_state(s) {
+        Some(resolved) => resolve_settled(&resolved),
+        None => resolve_settled(s),
     }
+}
+
+/// Apply the resolution trigger sweep when any table card carries effects. Almost every
+/// state has none, so the common path stays allocation-free.
+fn settled_state(s: &State) -> Option<State> {
+    if s.effect_blocks.is_empty() {
+        return None;
+    }
+    let has_effects = |side: &crate::model::Side| side.table.iter().any(|card| card.has_effects());
+    if !has_effects(&s.p) && !has_effects(&s.o) {
+        return None;
+    }
+    let mut resolved = s.clone();
+    effects::apply_trigger(&mut resolved, TRIGGER_RESOLUTION_BEFORE);
+    effects::apply_trigger(&mut resolved, TRIGGER_RESOLUTION_AFTER);
+    Some(resolved)
+}
+
+#[allow(clippy::if_same_then_else)]
+fn resolve_settled(s: &State) -> f32 {
+    match winner(s) {
+        w if w > 0 => s.o.bet as f32,
+        w if w < 0 => {
+            // Negate the integer first: a zero bet must produce +0.0, not -0.0, to match
+            // the managed solver's float bits exactly.
+            (-s.p.bet) as f32
+        }
+        _ => 0.0,
+    }
+}
+
+fn resolve_step(s: &State) -> TraceStep {
+    match settled_state(s) {
+        Some(resolved) => TraceStep::Resolve {
+            winner: winner(&resolved),
+            p_value: resolved.p_value(),
+            o_value: resolved.o_value(),
+        },
+        None => TraceStep::Resolve {
+            winner: winner(s),
+            p_value: s.p_value(),
+            o_value: s.o_value(),
+        },
+    }
+}
+
+/// Replay the expected line of play behind the chosen root move. Every player decision
+/// follows the move the search chose for that position; the opponent follows its policy.
+/// Stops early when a position is missing from the choice map (partial searches).
+fn build_trace(root: &State, root_move: Move, choices: &ChoiceMap) -> Vec<TraceStep> {
+    let mut steps = Vec::new();
+    let mut s = root.clone();
+    let mut next_move = Some(root_move);
+    let mut finished = false;
+
+    while !finished {
+        let mv = match next_move.take() {
+            Some(mv) => mv,
+            None => match choices.get(&memo_key(b'P', &s)) {
+                Some(&packed) => unpack_move(packed),
+                None => break,
+            },
+        };
+        let (child, card) = match apply_player_move(&s, mv) {
+            Some(applied) => applied,
+            None => break,
+        };
+        steps.push(TraceStep::Player { mv, card });
+        s = child;
+
+        if mv.kind == MoveKind::SleeveTop {
+            continue; // sleeving does not end the turn
+        }
+
+        // after_player_action: unpass check, early resolution when both stand pat.
+        opponent_unpass_check(&mut s);
+        if s.p.passed && s.o.passed {
+            opponent_unpass_check(&mut s);
+            if s.o.passed {
+                steps.push(resolve_step(&s));
+                break;
+            }
+        }
+
+        // run loop: opponent turns until the player has to choose again.
+        loop {
+            if s.p.passed && s.o.passed {
+                steps.push(resolve_step(&s));
+                finished = true;
+                break;
+            }
+            if !s.o.passed {
+                match opponent_act(&mut s) {
+                    OpponentAction::Draw(card) => steps.push(TraceStep::OpponentDraw { card }),
+                    OpponentAction::Pass => steps.push(TraceStep::OpponentPass),
+                }
+                opponent_unpass_check(&mut s);
+            }
+            if !s.p.passed {
+                break; // player's turn again
+            }
+            opponent_unpass_check(&mut s);
+            if s.p.passed && s.o.passed {
+                opponent_unpass_check(&mut s);
+                if s.o.passed {
+                    steps.push(resolve_step(&s));
+                    finished = true;
+                    break;
+                }
+            }
+        }
+    }
+    steps
 }
 
 /// Quick heuristic used when the search had to abort (or the root has no move).

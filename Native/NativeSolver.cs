@@ -106,6 +106,7 @@ namespace BlackJacket.OptimalPlay
                 Nodes = (int)reader.U64(),
                 Aborted = reader.U32() != 0,
                 ProgressTieBreak = reader.U32() != 0,
+                Partial = reader.U32() != 0,
                 PValue = reader.I32(),
                 OValue = reader.I32(),
                 PTarget = reader.I32(),
@@ -130,14 +131,32 @@ namespace BlackJacket.OptimalPlay
                 result.Legal.Add(reader.Move());
             }
 
-            // Evaluations come back in the same order as the leading legal moves.
+            // Evaluations are indexed; they cover whichever root moves completed.
             result.Evaluations = new List<MoveEvaluation>(evaluationCount);
             for (int i = 0; i < evaluationCount; i++)
             {
+                int index = (int)reader.U32();
+                float value = (float)reader.F64();
                 result.Evaluations.Add(new MoveEvaluation
                 {
-                    Move = result.Legal[i],
-                    Value = (float)reader.F64(),
+                    Index = index,
+                    Move = index >= 0 && index < result.Legal.Count ? result.Legal[index] : default,
+                    Value = value,
+                });
+            }
+
+            int traceCount = (int)reader.U32();
+            result.Trace = new List<SolveTraceStep>(traceCount);
+            for (int i = 0; i < traceCount; i++)
+            {
+                result.Trace.Add(new SolveTraceStep
+                {
+                    Kind = (int)reader.U32(),
+                    Move = reader.Move(),
+                    Card = reader.Card(),
+                    PValue = reader.I32(),
+                    OValue = reader.I32(),
+                    Winner = reader.I32(),
                 });
             }
             return result;
@@ -371,6 +390,28 @@ namespace BlackJacket.OptimalPlay
                 SleeveIndex = I32(),
                 ToOpponent = U32() != 0,
             };
+        }
+
+        /// <summary>A trace card: `u32 present`, then the value/type pairs and flags.</summary>
+        internal TraceCard Card()
+        {
+            if (U32() == 0)
+            {
+                return null;
+            }
+            int count = (int)U32();
+            var card = new TraceCard
+            {
+                Values = new int[count],
+                Types = new int[count],
+            };
+            for (int i = 0; i < count; i++)
+            {
+                card.Values[i] = I32();
+                card.Types[i] = (int)U32();
+            }
+            card.Flags = U32();
+            return card;
         }
     }
 }

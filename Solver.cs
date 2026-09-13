@@ -35,6 +35,8 @@ namespace BlackJacket.OptimalPlay
 
     internal sealed class MoveEvaluation
     {
+        /// <summary>Index into the solve result's legal move list.</summary>
+        public int Index;
         public SolverMove Move;
         public float Value;
     }
@@ -46,6 +48,10 @@ namespace BlackJacket.OptimalPlay
     internal sealed class SolverCard
     {
         public int[] Values;
+
+        /// <summary>`ModifiableValue.EType` bits per value, parallel to <see cref="Values"/>.</summary>
+        public int[] Types;
+
         public bool IsAce;
         public int Highest;
         public bool IsHollow;
@@ -54,6 +60,9 @@ namespace BlackJacket.OptimalPlay
         public bool Broken;
         public string Name;
         public string Effect;
+
+        /// <summary>Effects the native search models; see <see cref="EffectsMapper"/>.</summary>
+        public List<SolverEffect> Effects = new List<SolverEffect>();
 
         /// <summary>A card whose best possible contribution is zero or less (e.g. an awakened Heart).</summary>
         public bool IsDead
@@ -75,7 +84,7 @@ namespace BlackJacket.OptimalPlay
         /// <summary>Short human readable label, e.g. "Hearts_7_Upgraded[-7]".</summary>
         public string Label => $"{Name}[{string.Join("/", Values)}]";
 
-        public static SolverCard From(Card3D card)
+        public static SolverCard From(Card3D card, List<string> unmodeled = null)
         {
             GameCard gc = card.GameCard;
             int[] values = gc.Values;
@@ -84,20 +93,46 @@ namespace BlackJacket.OptimalPlay
             {
                 name = name.Substring("GameCard_".Length);
             }
+
+            var types = new int[values.Length];
+            List<ModifiableValue> cardValues = gc.CardValues;
+            for (int i = 0; i < types.Length && i < cardValues.Count; i++)
+            {
+                types[i] = (int)cardValues[i].Type.ModifiedValue;
+            }
+
+            var effects = new List<SolverEffect>();
+            var skipped = new List<string>();
+            EffectsMapper.Map(gc, unmodeled ?? skipped).ForEach(effects.Add);
+
             return new SolverCard
             {
                 // Own copy: the captured state is handed to the solver worker and may
                 // outlive the frame; game effects must not be able to mutate it.
                 Values = (int[])values.Clone(),
+                Types = types,
                 IsAce = gc.Id == "ace",
                 Highest = gc.HighestValue,
                 IsHollow = gc.IsHollow,
                 AlwaysInsight = gc.OpponentAlwaysHasInsightOnThisCard,
                 CanPlayOpponent = gc.CanBePlayedInOpponentsSlots,
-                Broken = values.Any(v => v < 0),
+                Broken = HasBroken(types),
                 Name = name,
                 Effect = string.IsNullOrEmpty(gc.EffectText) ? null : gc.EffectText.Replace("\n", " "),
+                Effects = effects,
             };
+        }
+
+        private static bool HasBroken(int[] types)
+        {
+            foreach (int type in types)
+            {
+                if ((type & (int)ModifiableValue.EType.Broken) != 0)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
     }
 
@@ -120,6 +155,9 @@ namespace BlackJacket.OptimalPlay
         public int Bet;
         public int SleeveDraws;
 
+        /// <summary>Coins in this side's stash (soul coins count 5).</summary>
+        public int Stash;
+
         public SolverCard Top => DeckPos < Deck.Count ? Deck[DeckPos] : null;
     }
 
@@ -137,8 +175,16 @@ namespace BlackJacket.OptimalPlay
         public int SleeveSize;
         public int[] SleeveCosts;
         public int Payable;
+        public int Pot;
+
+        /// <summary>True when sleeve costs may also draw on the winners pot.</summary>
+        public bool PotUsable;
+
         public bool Uprising;
         public bool Supper;
+
+        /// <summary>Effect class names the native search does not model, collected per capture.</summary>
+        public List<string> Unmodeled = new List<string>();
 
         public SolverSide P = new SolverSide();
         public SolverSide O = new SolverSide();

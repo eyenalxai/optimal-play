@@ -12,6 +12,7 @@
 //! error code. `out_len` receives the number of bytes written.
 
 pub mod batch;
+pub mod effects;
 pub mod model;
 pub mod protocol;
 pub mod solver;

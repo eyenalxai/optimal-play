@@ -280,7 +280,11 @@ namespace BlackJacket.OptimalPlay
                     sb.Append(" | ev ").Append(SolverReport.Format(result.Value));
                 }
                 sb.Append(" | ").Append(result.Nodes).Append(" nodes");
-                if (result.Aborted)
+                if (result.Partial)
+                {
+                    sb.Append(" (budget reached: best completed move)");
+                }
+                else if (result.Aborted)
                 {
                     sb.Append(" (budget reached, greedy fallback)");
                 }
@@ -301,6 +305,11 @@ namespace BlackJacket.OptimalPlay
                         .Append('=').Append(SolverReport.Format(ranked[i].Value));
                 }
                 OptimalPlayPlugin.Log.LogInfo(sb.ToString());
+
+                if (result.Trace.Count > 0)
+                {
+                    OptimalPlayPlugin.Log.LogInfo("Expected line:" + Environment.NewLine + SolverReport.DescribeTrace(result));
+                }
             }
 
             if (cfg.LogState.Value)
@@ -510,23 +519,46 @@ namespace BlackJacket.OptimalPlay
             int potValue = gc.UI.WinnersPot.CoinValue;
             bool potUsable = potValue <= 0 || ps.CoinManager.CanPay(stashValue + 1, true);
             sim.Payable = stashValue + (potUsable ? potValue : 0);
+            sim.Pot = potValue;
+            sim.PotUsable = potUsable;
 
+            var unmodeled = sim.Unmodeled;
             sim.P = BuildSide(ps.DrawPile.Cards, ps.DiscardPile.Cards.Length, gc.UI.Sleeve.GetCards(),
                 ps.TableDropArea.Cards, ps.TableDropArea.FreeSlotCount, ps.Bet.CoinValue,
-                ps.DrawToSleeveCount, ps.PassedOnDrawing);
+                ps.DrawToSleeveCount, ps.PassedOnDrawing, stashValue, unmodeled);
             sim.O = BuildSide(os.DrawPile.Cards, os.DiscardPile.Cards.Length, null,
                 os.TableDropArea.Cards, os.TableDropArea.FreeSlotCount, os.Bet.CoinValue,
-                0, os.PassedOnDrawing);
+                0, os.PassedOnDrawing, os.Stash.CoinValue, unmodeled);
+            ReportUnmodeled(sim);
             return sim;
         }
 
+        private static void ReportUnmodeled(SolverState sim)
+        {
+            if (sim.Unmodeled.Count == 0)
+            {
+                return;
+            }
+            foreach (string name in sim.Unmodeled)
+            {
+                if (_reportedUnmodeled.Add(name))
+                {
+                    OptimalPlayPlugin.Log.LogInfo($"Unmodeled card effect: {name} (the search treats it as a no-op).");
+                }
+            }
+            sim.Unmodeled.Clear();
+        }
+
+        private static readonly HashSet<string> _reportedUnmodeled = new HashSet<string>();
+
         private static SolverSide BuildSide(Card3D[] drawPile, int discardCount, Card3D[] sleeve,
-            Card3D[] table, int freeSlots, int bet, int sleeveDraws, bool passed)
+            Card3D[] table, int freeSlots, int bet, int sleeveDraws, bool passed, int stash,
+            List<string> unmodeled)
         {
             var deck = new List<SolverCard>(drawPile.Length);
             for (int i = drawPile.Length - 1; i >= 0; i--)
             {
-                deck.Add(SolverCard.From(drawPile[i]));
+                deck.Add(SolverCard.From(drawPile[i], unmodeled));
             }
 
             var side = new SolverSide
@@ -536,6 +568,7 @@ namespace BlackJacket.OptimalPlay
                 DeckPos = 0,
                 Capacity = freeSlots,
                 Bet = bet,
+                Stash = stash,
                 SleeveDraws = sleeveDraws,
                 Passed = passed,
             };
@@ -544,12 +577,12 @@ namespace BlackJacket.OptimalPlay
             {
                 foreach (Card3D card in sleeve)
                 {
-                    side.Sleeve.Add(SolverCard.From(card));
+                    side.Sleeve.Add(SolverCard.From(card, unmodeled));
                 }
             }
             foreach (Card3D card in table)
             {
-                side.Table.Add(SolverCard.From(card));
+                side.Table.Add(SolverCard.From(card, unmodeled));
             }
             return side;
         }

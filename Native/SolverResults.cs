@@ -13,6 +13,28 @@ namespace BlackJacket.OptimalPlay
         Unavailable,
     }
 
+    /// <summary>One card as it appears in a trace step; only values and types matter.</summary>
+    internal sealed class TraceCard
+    {
+        public int[] Values;
+        public int[] Types;
+        public uint Flags;
+
+        public string Label => "[" + string.Join("/", Values) + "]";
+    }
+
+    /// <summary>One action of the expected line of play behind the chosen move.</summary>
+    internal sealed class SolveTraceStep
+    {
+        /// <summary>0 player move, 1 opponent draw, 2 opponent pass, 3 resolve.</summary>
+        public int Kind;
+        public SolverMove Move;
+        public TraceCard Card;
+        public int PValue;
+        public int OValue;
+        public int Winner;
+    }
+
     /// <summary>Everything one native solve call reports back.</summary>
     internal sealed class SolveResult
     {
@@ -20,6 +42,10 @@ namespace BlackJacket.OptimalPlay
         public float Value;
         public int Nodes;
         public bool Aborted;
+
+        /// <summary>True when only some root moves were evaluated before the budget ran out.</summary>
+        public bool Partial;
+
         public bool ProgressTieBreak;
 
         public int PValue;
@@ -36,10 +62,14 @@ namespace BlackJacket.OptimalPlay
         public bool OpponentTableFull;
         public SleeveReason SleeveReason;
 
-        /// <summary>Legal root moves in preference order; evaluations are its prefix.</summary>
+        /// <summary>Legal root moves in canonical order.</summary>
         public List<SolverMove> Legal;
 
+        /// <summary>One entry per evaluated root move; <see cref="MoveEvaluation.Index"/> names the move.</summary>
         public List<MoveEvaluation> Evaluations;
+
+        /// <summary>Expected line of play behind <see cref="Best"/>; empty on budget aborts.</summary>
+        public List<SolveTraceStep> Trace;
     }
 
     /// <summary>Human readable rendering of solver results for logs and the status line.</summary>
@@ -80,15 +110,21 @@ namespace BlackJacket.OptimalPlay
             for (int i = 0; i < result.Legal.Count; i++)
             {
                 sb.Append("  ").Append(MoveLabel(result.Legal[i], root));
-                if (i < result.Evaluations.Count)
+                MoveEvaluation evaluation = FindEvaluation(result, i);
+                if (evaluation != null)
                 {
-                    sb.Append(" -> ").Append(Format(result.Evaluations[i].Value));
+                    sb.Append(" -> ").Append(Format(evaluation.Value));
                 }
                 else
                 {
                     sb.Append(" -> not evaluated");
                 }
                 sb.AppendLine();
+            }
+
+            if (result.Partial)
+            {
+                sb.AppendLine("  note: budget ran out; values cover completed root moves only");
             }
 
             if (!result.CanPass)
@@ -126,6 +162,73 @@ namespace BlackJacket.OptimalPlay
                         break;
                 }
                 sb.Append("  sleeve top -> unavailable (").Append(why).AppendLine(")");
+            }
+            return sb.ToString();
+        }
+
+        private static MoveEvaluation FindEvaluation(SolveResult result, int moveIndex)
+        {
+            foreach (MoveEvaluation evaluation in result.Evaluations)
+            {
+                if (evaluation.Index == moveIndex)
+                {
+                    return evaluation;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// The expected line of play after the chosen move, one line per action. Empty when
+        /// the search had to abort before it could replay the line.
+        /// </summary>
+        internal static string DescribeTrace(SolveResult result)
+        {
+            var sb = new StringBuilder();
+            foreach (SolveTraceStep step in result.Trace)
+            {
+                switch (step.Kind)
+                {
+                    case 0:
+                        sb.Append("  you ");
+                        if (step.Move.Kind == MoveKind.SleeveTop)
+                        {
+                            sb.Append("sleeve ");
+                        }
+                        else if (step.Move.Kind == MoveKind.PlaySleeve)
+                        {
+                            sb.Append("play sleeve ");
+                        }
+                        else if (step.Move.Kind == MoveKind.PlayTop)
+                        {
+                            sb.Append("play top ");
+                        }
+                        else
+                        {
+                            sb.Append("pass");
+                        }
+                        if (step.Card != null)
+                        {
+                            sb.Append(step.Card.Label);
+                        }
+                        if (step.Move.ToOpponent)
+                        {
+                            sb.Append(" to opponent");
+                        }
+                        break;
+                    case 1:
+                        sb.Append("  opponent draws ").Append(step.Card == null ? "?" : step.Card.Label);
+                        break;
+                    case 2:
+                        sb.Append("  opponent passes");
+                        break;
+                    default:
+                        sb.Append("  resolve: ")
+                            .Append(step.Winner > 0 ? "win" : step.Winner < 0 ? "loss" : "tie")
+                            .Append(" (").Append(step.PValue).Append(" vs ").Append(step.OValue).Append(")");
+                        break;
+                }
+                sb.AppendLine();
             }
             return sb.ToString();
         }
