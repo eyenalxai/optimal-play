@@ -282,7 +282,7 @@ namespace BlackJacket.OptimalPlay
                             return false;
                     }
                 }
-                if (universal.ExcludeSourceCard || !TryFilter(universal.CardFilterSet, out filter))
+                if (universal.ExcludeSourceCard || !TryFilter(universal.CardFilterSet, location, out filter))
                 {
                     return false;
                 }
@@ -319,7 +319,7 @@ namespace BlackJacket.OptimalPlay
             return true;
         }
 
-        private static bool TryFilter(CardFilterSet set, out uint filter)
+        private static bool TryFilter(CardFilterSet set, int location, out uint filter)
         {
             filter = 0;
             if (set == null || set.Filters == null || set.Filters.Length == 0)
@@ -330,13 +330,21 @@ namespace BlackJacket.OptimalPlay
             {
                 return false;
             }
-            int order = EnumInt(take, "_order");
+            int mode = EnumInt(take, "_order");
             int count = IntField(take, "_num");
-            if (order < 0 || order > 1 || count < 0 || count > 0xFFF)
+            // The game enumerates a draw pile bottom-first while the solver starts at the
+            // top, so first/last flip for draw-pile-only gathers.
+            bool drawOnly = (location & (int)ELocation.DrawPile) != 0
+                && (location & ((int)ELocation.Table | (int)ELocation.DiscardPile | (int)ELocation.Sleeve)) == 0;
+            if (drawOnly)
+            {
+                mode = 1 - mode;
+            }
+            if (mode < 0 || mode > 1 || count < 0 || count > 0xFFF)
             {
                 return false;
             }
-            filter = 1u | ((uint)order << 4) | ((uint)count << 6);
+            filter = 1u | ((uint)mode << 4) | ((uint)count << 6);
             return true;
         }
 
